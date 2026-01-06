@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Studio-Grade Soft Limiter + Auto-Ducking)
+// index.js (Final Cloud: Stable Simple Mixer)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Studio DSP Active"));
+app.get('/', (req, res) => res.send("Server Online: Stable Mixer Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -27,51 +27,44 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // --- CONFIGURATION ---
-const AI_VOL_MULTIPLIER = 1.5; // Boost AI (Safe level)
-const INPUT_BOOST = 5.0;       // Boost User (For Scribe)
-const DUCK_ATTACK = 0.2;       // How fast music fades OUT (0.0 to 1.0)
-const DUCK_RELEASE = 0.05;     // How fast music fades IN (0.0 to 1.0)
-const MUSIC_VOL_MAX = 0.15;    // Max Music Volume
-const MUSIC_VOL_MIN = 0.02;    // Dimmed Music Volume
+// Simple fixed volumes. No dynamic ducking to avoid glitches.
+const BACKGROUND_VOLUME = 0.10; // 10% volume for lobby
+const AI_VOLUME = 1.5;          // 150% volume for AI (Clear but safe)
+const USER_INPUT_BOOST = 3.0;   // 300% Boost for your voice to Scribe
 
-// --- DSP: SOFT LIMITER (The Anti-Distortion Filter) ---
-// Instead of chopping off the top of the wave, we curve it smoothly.
-function softLimit(sample) {
-    // Normalize to -1.0 to 1.0 range
-    const x = sample / 32768.0;
-    
-    // Apply Soft Clip (Hyperbolic Tangent)
-    // This squashes loud sounds smoothly like analog tape
-    const limit = Math.tanh(x);
-    
-    // Scale back to 16-bit
-    return limit * 32768.0;
-}
+// --- TABLES (Pre-calculated for speed) ---
 
-// --- TABLES ---
-const muLawToLinearTable_Input = new Int16Array(256); // For Scribe
-const muLawToLinearTable_Output = new Int16Array(256); // For User
-
+// 1. INPUT DECODER (Phone -> Scribe)
+const muLawToLinearTable_Input = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; 
+    let muLawByte = ~i;
     let sign = (muLawByte & 0x80) >> 7;
     let exponent = (muLawByte & 0x70) >> 4;
     let mantissa = muLawByte & 0x0F;
     let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
     sample = sign === 0 ? -sample : sample;
+    
+    // Simple boost, hard clamp
+    let boosted = sample * USER_INPUT_BOOST;
+    if (boosted > 32767) boosted = 32767;
+    if (boosted < -32768) boosted = -32768;
+    muLawToLinearTable_Input[i] = boosted;
+}
 
-    // Table 1: Input (Boosted 500% for Scribe)
-    let inSample = sample * INPUT_BOOST;
-    if (inSample > 32767) inSample = 32767;
-    if (inSample < -32768) inSample = -32768;
-    muLawToLinearTable_Input[i] = inSample;
-
-    // Table 2: Output (Clean for User)
-    // We do NOT boost here. We let the Soft Limiter handle loudness later.
+// 2. OUTPUT DECODER (AI -> Phone)
+const muLawToLinearTable_Output = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+    let muLawByte = ~i;
+    let sign = (muLawByte & 0x80) >> 7;
+    let exponent = (muLawByte & 0x70) >> 4;
+    let mantissa = muLawByte & 0x0F;
+    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
+    sample = sign === 0 ? -sample : sample;
+    // No boost here, we mix later
     muLawToLinearTable_Output[i] = sample;
 }
 
-// Encoder Table
+// 3. ENCODER (Linear -> MuLaw)
 const linearToMuLawTable = new Uint8Array(65536);
 const BIAS = 0x84;
 const CLIP = 32635;
@@ -109,6 +102,7 @@ https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/l
     res.on('end', () => {
         const fullFile = Buffer.concat(data);
         if (fullFile.length > 100) {
+            // Strip header if it's a WAV (simple heuristic: first 44 bytes)
             backgroundBuffer = fullFile.subarray(44); 
             console.log(`[SYSTEM] Background Sound Loaded! (${backgroundBuffer.length} bytes)`);
         }
@@ -126,9 +120,6 @@ wss.on('connection', (ws) => {
     let lastInputSample = 0;
     let bgIndex = 0;
     let outputIntervalId = null;
-    
-    // Ducking State (Smooth Fader)
-    let currentMusicGain = MUSIC_VOL_MAX;
 
     ws.on('message', (message) => {
         try {
@@ -145,6 +136,7 @@ wss.on('connection', (ws) => {
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
+                    // Start Mixer Heartbeat
                     if (!outputIntervalId) {
                         outputIntervalId = setInterval(streamAudioToTwilio, 20);
                     }
@@ -152,22 +144,12 @@ wss.on('connection', (ws) => {
                 
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
-                    
+                    // Standard logic to capture AI audio chunks
                     let chunkData = null;
-                    if (aiMsg.audio_event) {
-                        if (aiMsg.audio_event.audio_base64_chunk) {
-                            chunkData = aiMsg.audio_event.audio_base64_chunk;
-                        } else if (aiMsg.audio_event.audio) chunkData = aiMsg.audio_event.audio;
-                        else {
-                            const keys = Object.keys(aiMsg.audio_event);
-                            for (const key of keys) {
-                                const val = aiMsg.audio_event[key];
-                                if (typeof val === 'string' && val.length > 100) {
-                                    chunkData = val;
-                                    break;
-                                }
-                            }
-                        }
+                    if (aiMsg.audio_event?.audio_base64_chunk) {
+                        chunkData = aiMsg.audio_event.audio_base64_chunk;
+                    } else if (aiMsg.audio_event?.audio) {
+                         chunkData = aiMsg.audio_event.audio;
                     }
 
                     if (chunkData) {
@@ -181,19 +163,24 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // INPUT: User -> Scribe (Boosted)
+                    // INPUT: Phone -> Scribe (Boosted)
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
+                    // Upsample 8k -> 16k for Scribe
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
                         const currentSample = muLawToLinearTable_Input[twilioChunk[i]];
                         const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        
                         pcmChunk.writeInt16LE(midPoint, i * 4);
                         pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
+                        
                         lastInputSample = currentSample;
                     }
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
+                    
+                    // Send every 100ms (Stability > Speed for now)
                     if (pcmInputQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({ 
                             user_audio_chunk: pcmInputQueue.toString('base64') 
@@ -212,59 +199,43 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
-    // --- STUDIO MIXER ---
+    // --- STABLE MIXER ---
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
         const CHUNK_SIZE = 160; 
         const mixedBuffer = Buffer.alloc(CHUNK_SIZE);
         let hasBackground = (backgroundBuffer.length > 0);
+        
         let aiChunk = null;
-
-        // Check availability
         if (audioQueue.length >= CHUNK_SIZE) {
             aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
-        // --- SMOOTH AUTO-DUCKING ---
-        // Target is what we WANT the volume to be.
-        // Current is what the volume ACTUALLY is.
-        // We gently slide Current towards Target.
-        const targetGain = aiChunk ? MUSIC_VOL_MIN : MUSIC_VOL_MAX;
-        
-        if (currentMusicGain > targetGain) {
-            // Fade OUT (Attack)
-            currentMusicGain -= DUCK_ATTACK * (currentMusicGain - targetGain);
-        } else {
-            // Fade IN (Release)
-            currentMusicGain += DUCK_RELEASE * (targetGain - currentMusicGain);
-        }
-
         for (let i = 0; i < CHUNK_SIZE; i++) {
-            let finalSample = 0;
+            let sample = 0;
 
-            // 1. Add Background
+            // 1. Add Background (Fixed Volume)
             if (hasBackground) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0;
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                finalSample += (bgSample * currentMusicGain);
+                sample += (bgSample * BACKGROUND_VOLUME);
             }
 
-            // 2. Add AI Voice (with moderate multiplier)
+            // 2. Add AI Voice (Fixed Boost)
             if (aiChunk) {
                 const aiSample = muLawToLinearTable_Output[aiChunk[i]];
-                finalSample += (aiSample * AI_VOL_MULTIPLIER);
+                sample += (aiSample * AI_VOLUME);
             }
 
-            // 3. SOFT LIMITER (The Magic Fix)
-            // Curves the audio so it never "cracks", even if volume is 200%
-            finalSample = softLimit(finalSample);
+            // 3. Simple Hard Clamp (Reliable)
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
 
-            // 4. Convert to Mu-Law
-            // Offset to positive for array index lookup
-            let tableIndex = Math.floor(finalSample) + 32768;
+            // 4. Encode
+            let tableIndex = Math.floor(sample) + 32768;
             if (tableIndex < 0) tableIndex = 0;
             if (tableIndex > 65535) tableIndex = 65535;
             
