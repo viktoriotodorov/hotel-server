@@ -1,4 +1,4 @@
-// index.js (The "Sherlock Holmes" Logger)
+// index.js (Cloud: Smart-Finder & Safety Dam)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Logger Online"));
+app.get('/', (req, res) => res.send("Server Online: Smart-Finder Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -27,8 +27,12 @@ const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
+    
     let elevenLabsWs = null;
     let streamSid = null;
+    let audioQueue = Buffer.alloc(0); 
+    let isPlaying = false;
+    let intervalId = null;
 
     ws.on('message', (message) => {
         try {
@@ -36,9 +40,9 @@ wss.on('connection', (ws) => {
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log(`[TWILIO] Stream Started! SID: ${streamSid}`);
+                console.log(`[TWILIO] Stream Started!`);
 
-                // Connect to ElevenLabs
+                // 1. Connect to ElevenLabs
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -47,41 +51,52 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
                 
                 elevenLabsWs.on('message', (data) => {
-                    // *** DIAGNOSTIC LOGGING ***
-                    // We will print the KEYS of the message to see the structure
-                    try {
-                        const aiMsg = JSON.parse(data);
-                        const keys = Object.keys(aiMsg);
-                        console.log(`[11LABS MSG] Type: ${aiMsg.type} | Keys: ${JSON.stringify(keys)}`);
-                        
-                        // If there is an 'audio_event', inspect it deeper
-                        if (aiMsg.audio_event) {
-                             console.log(`[11LABS AUDIO] Chunk Size: ${aiMsg.audio_event.audio_base64_chunk ? aiMsg.audio_event.audio_base64_chunk.length : 'NULL'}`);
-                        }
+                    const aiMsg = JSON.parse(data);
+                    
+                    // *** SMART FINDER LOGIC ***
+                    // We don't know the exact key name, so we look for it.
+                    let chunkData = null;
 
-                        // Try to find audio ANYWHERE and send it
-                        let chunk = null;
-                        if (aiMsg.audio_event?.audio_base64_chunk) {
-                            chunk = aiMsg.audio_event.audio_base64_chunk;
-                        } else if (aiMsg.audio) {
-                            chunk = aiMsg.audio;
-                        }
+                    if (aiMsg.audio_event) {
+                        // Log the keys so we can see the real name for next time
+                        // console.log(`[DEBUG] Keys in audio_event: ${Object.keys(aiMsg.audio_event)}`);
 
-                        if (chunk) {
-                            const payload = {
-                                event: 'media',
-                                streamSid: streamSid,
-                                media: { payload: chunk }
-                            };
-                            ws.send(JSON.stringify(payload));
+                        // Check common names
+                        if (aiMsg.audio_event.audio_base64_chunk) {
+                            chunkData = aiMsg.audio_event.audio_base64_chunk;
+                        } else if (aiMsg.audio_event.audio) {
+                            chunkData = aiMsg.audio_event.audio;
+                        } else {
+                            // Brute Force: Find any value that is a long string (audio data)
+                            const keys = Object.keys(aiMsg.audio_event);
+                            for (const key of keys) {
+                                const val = aiMsg.audio_event[key];
+                                if (typeof val === 'string' && val.length > 100) {
+                                    chunkData = val;
+                                    break;
+                                }
+                            }
                         }
-                    } catch (err) {
-                        console.log(`[11LABS RAW] Not JSON: ${data.toString().substring(0, 50)}...`);
+                    }
+
+                    if (chunkData) {
+                        // 2. FILL THE DAM
+                        const newChunk = Buffer.from(chunkData, 'base64');
+                        audioQueue = Buffer.concat([audioQueue, newChunk]);
+
+                        // 3. OPEN THE FLOODGATES (Buffer 0.5s to prevent silence)
+                        if (!isPlaying && audioQueue.length >= 4000) {
+                            console.log("[SYSTEM] Dam Full - Playing Audio!");
+                            isPlaying = true;
+                            intervalId = setInterval(streamAudioToTwilio, 20);
+                        }
                     }
                 });
 
                 elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
-                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
+                elevenLabsWs.on('close', () => {
+                    console.log("[11LABS] Disconnected");
+                });
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
@@ -89,11 +104,32 @@ wss.on('connection', (ws) => {
                 }
             } else if (msg.event === 'stop') {
                 if (elevenLabsWs) elevenLabsWs.close();
+                clearInterval(intervalId);
             }
         } catch (e) {
             console.error(e);
         }
     });
+
+    ws.on('close', () => clearInterval(intervalId));
+
+    // THE STREAMER
+    function streamAudioToTwilio() {
+        if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
+
+        const CHUNK_SIZE = 160; 
+
+        if (audioQueue.length >= CHUNK_SIZE) {
+            const chunkToSend = audioQueue.subarray(0, CHUNK_SIZE);
+            audioQueue = audioQueue.subarray(CHUNK_SIZE);
+
+            ws.send(JSON.stringify({
+                event: 'media',
+                streamSid: streamSid,
+                media: { payload: chunkToSend.toString('base64') }
+            }));
+        }
+    }
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
