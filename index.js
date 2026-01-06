@@ -1,64 +1,19 @@
-// index.js (Manual Mixing + Twilio Sync + Upsampling Input)
+// index.js (Diagnostic Mode: Synthetic Tone + AI Mixer)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const alawmulaw = require('alawmulaw'); // Using the library for safety
 
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-const BG_VOLUME = 0.01; // 1% Volume (Start extremely low to test)
-
-// --- LOAD BACKGROUND AUDIO ---
-let bgBuffer = null;
-try {
-    const filePath = path.join(__dirname, 'background.wav');
-    const fileData = fs.readFileSync(filePath);
-    // Remove 44-byte Header
-    const rawBuffer = fileData.subarray(44); 
-    bgBuffer = new Int16Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.length / 2);
-    console.log(`[SYSTEM] Background audio loaded: ${bgBuffer.length} samples`);
-} catch (err) {
-    console.error("[SYSTEM] Failed to load background.wav", err.message);
-}
-
-// --- MANUAL LOOKUP TABLES (No Libraries) ---
-
-// 1. Mu-Law to Linear (For Input & AI Decoding)
-const muLawToLinearTable = new Int16Array(256);
-const VOLUME_BOOST = 5.0; // Input boost for AI
-for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; 
-    let sign = (muLawByte & 0x80) >> 7;
-    let exponent = (muLawByte & 0x70) >> 4;
-    let mantissa = muLawByte & 0x0F;
-    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
-    sample = sign === 0 ? -sample : sample;
-    // Note: We apply boost only when reading input, not here globally
-    muLawToLinearTable[i] = sample; 
-}
-
-// 2. Linear to Mu-Law (For Output Encoding)
-const linearToMuLawTable = new Int8Array(65536); // Maps -32768..32767 to mu-law byte
-for (let i = -32768; i < 32768; i++) {
-    let sample = i;
-    let sign = (sample < 0) ? 0x80 : 0;
-    if (sample < 0) sample = -sample;
-    sample = sample + 33;
-    if (sample > 8192) sample = 8192;
-    let exponent = Math.floor(Math.log(sample) / Math.log(2)) - 5;
-    if (exponent < 0) exponent = 0;
-    let mantissa = (sample >> (exponent + 1)) & 0x0F;
-    let muLawByte = ~(sign | (exponent << 4) | mantissa);
-    // Index offset by 32768 to handle negative array indices
-    linearToMuLawTable[i + 32768] = muLawByte;
-}
+const TONE_VOLUME = 0.05; // 5% Volume
+const TONE_FREQ = 200;    // 200Hz Low Hum (Like a dial tone but lower)
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Ultimate Sync Server Online"));
+app.get('/', (req, res) => res.send("Diagnostic Server Online"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -81,11 +36,13 @@ wss.on('connection', (ws) => {
     let elevenLabsWs = null;
     let streamSid = null;
     
-    // Audio State
-    let aiLinearQueue = []; // Holds DECODED Linear PCM samples from AI
-    let pcmInputQueue = Buffer.alloc(0); // For buffering input to AI
-    let lastInputSample = 0;
-    let bgIndex = 0;
+    // Audio Buffers
+    let aiLinearQueue = []; 
+    let pcmInputQueue = Buffer.alloc(0);
+    
+    // Tone Generator State
+    let phase = 0; 
+    const phaseIncrement = (2 * Math.PI * TONE_FREQ) / 8000; // 8000Hz Sample Rate
 
     ws.on('message', (message) => {
         try {
@@ -105,15 +62,13 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     if (aiMsg.audio_event?.audio_base64_chunk) {
-                        // 1. Receive u-law chunk
-                        const uLawChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
+                        // Decode AI (u-law -> Linear) immediately
+                        const rawAudio = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
+                        const pcmSamples = alawmulaw.mulaw.decode(rawAudio);
                         
-                        // 2. IMMEDIATELY Decode to Linear PCM and store
-                        // This prevents any "u-law in the mixer" errors later
-                        for (let i = 0; i < uLawChunk.length; i++) {
-                            const uLawByte = uLawChunk[i];
-                            const linearSample = muLawToLinearTable[uLawByte];
-                            aiLinearQueue.push(linearSample);
+                        // Add to queue
+                        for (let i = 0; i < pcmSamples.length; i++) {
+                            aiLinearQueue.push(pcmSamples[i]);
                         }
                     }
                 });
@@ -122,75 +77,45 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
-                if (!bgBuffer) return; // Wait for background file load
-
-                // --- 1. HANDLE INPUT (User -> AI) ---
+                // 1. INPUT (User -> AI) - Using Pass-Through to be safe
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    const twilioChunk = Buffer.from(msg.media.payload, 'base64');
-                    // Upsample 8k -> 16k + Boost
-                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
-                    for (let i = 0; i < twilioChunk.length; i++) {
-                        // Decode & Boost
-                        let sample = muLawToLinearTable[twilioChunk[i]] * VOLUME_BOOST;
-                        // Clamp
-                        if (sample > 32767) sample = 32767;
-                        if (sample < -32768) sample = -32768;
-                        
-                        // Upsample (Linear Interpolation)
-                        const midPoint = Math.floor((lastInputSample + sample) / 2);
-                        
-                        pcmChunk.writeInt16LE(midPoint, i * 4);
-                        pcmChunk.writeInt16LE(sample, i * 4 + 2);
-                        lastInputSample = sample;
-                    }
-                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
-
-                    // Send to AI (buffered)
-                    if (pcmInputQueue.length >= 1600) {
-                        elevenLabsWs.send(JSON.stringify({ 
-                            user_audio_chunk: pcmInputQueue.toString('base64') 
-                        }));
-                        pcmInputQueue = Buffer.alloc(0);
-                    }
+                    elevenLabsWs.send(JSON.stringify({ 
+                        user_audio_chunk: msg.media.payload 
+                    }));
                 }
 
-                // --- 2. HANDLE OUTPUT (AI + Music -> User) ---
-                // We use the INPUT packet size to determine the OUTPUT packet size.
-                // This keeps everything perfectly synchronized.
+                // 2. OUTPUT (AI + Synthetic Tone -> User)
                 const inputLength = Buffer.from(msg.media.payload, 'base64').length; 
-                // In u-law 8000Hz, 1 byte = 1 sample.
-                const neededSamples = inputLength; 
-
-                const outputMuLawBuffer = Buffer.alloc(neededSamples);
+                const neededSamples = inputLength; // Sync with input rate
+                const outputSamples = new Int16Array(neededSamples);
 
                 for (let i = 0; i < neededSamples; i++) {
-                    // A. Get Background Sample
-                    const bgSample = bgBuffer[bgIndex] * BG_VOLUME;
-                    bgIndex = (bgIndex + 1) % bgBuffer.length;
+                    // A. Generate Synthetic Tone (Math.sin)
+                    // This creates a perfect, mathematical sound. No file reading errors possible.
+                    const toneSample = Math.sin(phase) * 32767 * TONE_VOLUME;
+                    phase += phaseIncrement;
+                    if (phase > 2 * Math.PI) phase -= 2 * Math.PI;
 
-                    // B. Get AI Sample (if available)
+                    // B. Get AI Sample
                     let aiSample = 0;
                     if (aiLinearQueue.length > 0) {
                         aiSample = aiLinearQueue.shift();
                     }
 
                     // C. Mix
-                    let mixed = bgSample + aiSample;
+                    let mixed = toneSample + aiSample;
+                    
                     // Clamp
-                    if (mixed > 32767) mixed = 32767;
-                    if (mixed < -32768) mixed = -32768;
-
-                    // D. Encode to Mu-Law (Using Manual Table)
-                    // Offset index by 32768 for the table lookup
-                    outputMuLawBuffer[i] = linearToMuLawTable[Math.floor(mixed) + 32768];
+                    outputSamples[i] = Math.max(-32768, Math.min(32767, mixed));
                 }
 
-                // Send Response immediately
+                // Encode & Send
                 if (streamSid) {
+                    const muLawBuffer = alawmulaw.mulaw.encode(outputSamples);
                     ws.send(JSON.stringify({
                         event: 'media',
                         streamSid: streamSid,
-                        media: { payload: outputMuLawBuffer.toString('base64') }
+                        media: { payload: Buffer.from(muLawBuffer).toString('base64') }
                     }));
                 }
 
@@ -208,3 +133,4 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
+
