@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Input Decoding + Output Buffering)
+// index.js (Final Cloud: HD Upsampling 16kHz)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Audio Transcoding Active"));
+app.get('/', (req, res) => res.send("Server Online: 16kHz Upsampling Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -26,8 +26,6 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // --- MU-LAW DECODING LOGIC ---
-// We convert 8-bit Mu-Law (Telephone) to 16-bit PCM (Computer)
-// This fixes the "Weak/Distorted" voice issue.
 const muLawToLinear = (muLawByte) => {
     const BIAS = 0x84;
     let sign = (muLawByte & 0x80) >> 7;
@@ -43,13 +41,9 @@ wss.on('connection', (ws) => {
     
     let elevenLabsWs = null;
     let streamSid = null;
-    
-    // OUTPUT BUFFER (AI -> Phone)
     let audioQueue = Buffer.alloc(0); 
     let isPlaying = false;
     let outputIntervalId = null;
-
-    // INPUT BUFFER (Phone -> AI)
     let pcmInputQueue = Buffer.alloc(0);
 
     ws.on('message', (message) => {
@@ -60,8 +54,8 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started!`);
 
-                // 1. Connect to ElevenLabs
-                // We KEEP output as ulaw_8000 because Twilio handles that fine.
+                // Connect to ElevenLabs
+                // Output is still ulaw_8000 (Phone standard)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -72,7 +66,7 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     
-                    // OUTPUT LOGIC (Keep exactly what worked)
+                    // OUTPUT LOGIC (Smart Finder)
                     let chunkData = null;
                     if (aiMsg.audio_event) {
                         if (aiMsg.audio_event.audio_base64_chunk) {
@@ -107,21 +101,25 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // *** 2. DECODE TWILIO AUDIO ***
-                    // Twilio sends Mu-Law (base64). We decode it to raw PCM.
+                    // *** 16kHz UPSAMPLING LOGIC ***
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
-                    const pcmChunk = Buffer.alloc(twilioChunk.length * 2); // PCM is 16-bit (2 bytes) per sample
+                    
+                    // We need 4 bytes output for every 1 byte input
+                    // (1 byte -> 1 sample (2 bytes) -> Double it (4 bytes))
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
                         const pcmSample = muLawToLinear(twilioChunk[i]);
-                        pcmChunk.writeInt16LE(pcmSample, i * 2);
+                        // Write the sample TWICE to upsample 8k -> 16k
+                        const offset = i * 4;
+                        pcmChunk.writeInt16LE(pcmSample, offset);
+                        pcmChunk.writeInt16LE(pcmSample, offset + 2);
                     }
 
-                    // Buffer the PCM data
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
 
-                    // Send 100ms chunks (PCM 8000Hz 16-bit = 1600 bytes per 100ms)
-                    const INPUT_THRESHOLD = 1600; 
+                    // Send chunks of approx 100ms (16kHz * 2 bytes * 0.1s = 3200 bytes)
+                    const INPUT_THRESHOLD = 3200; 
 
                     if (pcmInputQueue.length >= INPUT_THRESHOLD) {
                         elevenLabsWs.send(JSON.stringify({ 
