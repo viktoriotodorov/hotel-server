@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Split-Path Audio Engine)
+// index.js (Final Cloud: Auto-Ducking Mixer + 300% Output Boost)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Split-Path Engine Active"));
+app.get('/', (req, res) => res.send("Server Online: Auto-Ducking Mixer Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -26,9 +26,14 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- TABLE 1: CLEAN DECODER (For AI Output) ---
-// This keeps the AI voice pure and distortion-free.
-const muLawToLinearTable_Clean = new Int16Array(256);
+// --- CONFIGURATION ---
+const AI_OUTPUT_BOOST = 3.0;  // Boost AI Voice by 300% (Loud & Clear)
+const USER_INPUT_BOOST = 5.0; // Boost Your Voice by 500% (For Scribe)
+const MUSIC_VOL_LOW = 0.05;   // Music volume when AI is talking (5%)
+const MUSIC_VOL_HIGH = 0.10;  // Music volume when AI is silent (10%)
+
+// --- TABLE 1: OUTPUT DECODER (AI -> Phone) ---
+const muLawToLinearTable_Output = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
     let muLawByte = ~i; 
     let sign = (muLawByte & 0x80) >> 7;
@@ -36,32 +41,37 @@ for (let i = 0; i < 256; i++) {
     let mantissa = muLawByte & 0x0F;
     let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
     sample = sign === 0 ? -sample : sample;
-    // NO BOOST HERE
-    muLawToLinearTable_Clean[i] = sample;
-}
-
-// --- TABLE 2: BOOSTED DECODER (For User Input) ---
-// This amplifies YOUR voice 5x so Scribe hears you clearly.
-const muLawToLinearTable_Boosted = new Int16Array(256);
-const INPUT_BOOST = 5.0; 
-
-for (let i = 0; i < 256; i++) {
-    let sample = muLawToLinearTable_Clean[i]; // Start with clean value
-    sample = sample * INPUT_BOOST;            // Apply 500% Boost
     
-    // Clamp to prevent overflow errors
+    // APPLY 300% BOOST
+    sample = sample * AI_OUTPUT_BOOST;
     if (sample > 32767) sample = 32767;
     if (sample < -32768) sample = -32768;
     
-    muLawToLinearTable_Boosted[i] = sample;
+    muLawToLinearTable_Output[i] = sample;
 }
 
-// --- TABLE 3: HI-FI ENCODER (Linear -> MuLaw) ---
-// For sending the final mix to the phone.
+// --- TABLE 2: INPUT DECODER (Phone -> Scribe) ---
+const muLawToLinearTable_Input = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+    let muLawByte = ~i; 
+    let sign = (muLawByte & 0x80) >> 7;
+    let exponent = (muLawByte & 0x70) >> 4;
+    let mantissa = muLawByte & 0x0F;
+    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
+    sample = sign === 0 ? -sample : sample;
+    
+    // APPLY 500% BOOST
+    sample = sample * USER_INPUT_BOOST;
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    
+    muLawToLinearTable_Input[i] = sample;
+}
+
+// --- TABLE 3: ENCODER (Linear -> MuLaw) ---
 const linearToMuLawTable = new Uint8Array(65536);
 const BIAS = 0x84;
 const CLIP = 32635;
-
 for (let i = 0; i < 65536; i++) {
     let sample = i - 32768;
     if (sample < -CLIP) sample = -CLIP;
@@ -169,14 +179,12 @@ wss.on('connection', (ws) => {
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     // *** INPUT PROCESSING (USER -> AI) ***
-                    // USE BOOSTED TABLE HERE (Loud voice for Scribe)
+                    // Use the 500% Boosted Table for Scribe
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        // Use BOOSTED table
-                        const currentSample = muLawToLinearTable_Boosted[twilioChunk[i]];
-                        
+                        const currentSample = muLawToLinearTable_Input[twilioChunk[i]];
                         const midPoint = Math.floor((lastInputSample + currentSample) / 2);
                         pcmChunk.writeInt16LE(midPoint, i * 4);
                         pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
@@ -203,7 +211,7 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
-    // --- OUTPUT MIXER (AI -> USER) ---
+    // --- AUTO-DUCKING MIXER (AI -> USER) ---
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
@@ -214,10 +222,17 @@ wss.on('connection', (ws) => {
         if (backgroundBuffer.length > 0) hasBackground = true;
 
         let aiChunk = null;
-        if (audioQueue.length >= CHUNK_SIZE) {
+        // Check if AI is talking right now
+        const isAiTalking = audioQueue.length >= CHUNK_SIZE;
+
+        if (isAiTalking) {
             aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
+
+        // Determine Music Volume Target
+        // If AI talks, set Low Volume. If AI silent, set High Volume.
+        const currentMusicVol = isAiTalking ? MUSIC_VOL_LOW : MUSIC_VOL_HIGH;
 
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sample = 0;
@@ -226,17 +241,20 @@ wss.on('connection', (ws) => {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0;
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                sample += (bgSample * 0.15); 
+                
+                // Mix Music
+                sample += (bgSample * currentMusicVol); 
             }
 
             if (aiChunk) {
-                // *** OUTPUT PROCESSING (AI -> USER) ***
-                // USE CLEAN TABLE HERE (No Boost, No Distortion)
-                const aiSample = muLawToLinearTable_Clean[aiChunk[i]];
-                
-                // We slightly reduce AI volume (0.9x) to make room for music without clipping
-                sample += (aiSample * 0.9);
+                // Mix AI (Already boosted 300% by the table)
+                const aiSample = muLawToLinearTable_Output[aiChunk[i]];
+                sample += aiSample;
             }
+
+            // Final Clamp (Prevent "Super Distortion")
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
 
             let tableIndex = Math.floor(sample) + 32768;
             if (tableIndex < 0) tableIndex = 0;
