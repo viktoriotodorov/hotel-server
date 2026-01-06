@@ -3,16 +3,15 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const alawmulaw = require('alawmulaw'); // Updated Library
+const alawmulaw = require('alawmulaw'); // <--- THIS IS THE FIX
 
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-const MIC_BOOST = 5.0; // 500% Volume Boost for the user's voice
-const BG_VOLUME = 0.2; // 20% Volume for the background noise
-const CHUNK_SIZE = 160; // 20ms of audio at 8000Hz
+const MIC_BOOST = 5.0; 
+const BG_VOLUME = 0.2; 
+const CHUNK_SIZE = 160; 
 
-// Validate Environment Variables
 if (!process.env.ELEVENLABS_API_KEY || !process.env.AGENT_ID) {
     console.error("[SYSTEM] ERROR: Missing Environment Variables");
     process.exit(1);
@@ -22,19 +21,12 @@ if (!process.env.ELEVENLABS_API_KEY || !process.env.AGENT_ID) {
 let bgBuffer = null;
 try {
     const filePath = path.join(__dirname, 'background.wav');
-    // Read the file
     const fileData = fs.readFileSync(filePath);
-    
-    // WAV Header Removal:
-    // A standard WAV header is 44 bytes. We remove it to get raw audio samples.
     const rawBuffer = fileData.subarray(44); 
-    
-    // Convert bytes to 16-bit integers (Linear PCM)
     bgBuffer = new Int16Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.length / 2);
-    
     console.log(`[SYSTEM] Background audio loaded: ${bgBuffer.length} samples`);
 } catch (err) {
-    console.error("[SYSTEM] Failed to load background.wav. Please upload it to GitHub.", err.message);
+    console.error("[SYSTEM] Failed to load background.wav", err.message);
 }
 
 const app = express();
@@ -62,60 +54,40 @@ wss.on('connection', (ws) => {
     let elevenLabsWs = null;
     let streamSid = null;
     let mixerInterval = null;
-    
     let aiAudioQueue = []; 
     let bgIndex = 0;
 
-    // Helper: Send audio to Twilio
     const sendAudioToTwilio = (audioData) => {
         if (!streamSid) return;
-        const payload = {
+        ws.send(JSON.stringify({
             event: 'media',
             streamSid: streamSid,
             media: { payload: audioData }
-        };
-        ws.send(JSON.stringify(payload));
+        }));
     };
 
-    // --- HEARTBEAT MIXER (20ms Loop) ---
-    // This runs constantly to mix Background + AI
+    // --- HEARTBEAT MIXER (20ms) ---
     const startMixer = () => {
         if (mixerInterval) clearInterval(mixerInterval);
-        
         mixerInterval = setInterval(() => {
             if (!streamSid || !bgBuffer) return;
 
-            // 1. Prepare output buffer for 20ms
             const outputSamples = new Int16Array(CHUNK_SIZE);
-            
-            // 2. Get samples from AI Queue (if any)
             const aiSamples = aiAudioQueue.splice(0, CHUNK_SIZE);
 
-            // 3. Mix Loop
             for (let i = 0; i < CHUNK_SIZE; i++) {
-                // Background Sample
                 const bgSample = bgBuffer[bgIndex] * BG_VOLUME;
-                bgIndex = (bgIndex + 1) % bgBuffer.length; // Loop audio
-
-                // AI Sample (or 0 if silent)
+                bgIndex = (bgIndex + 1) % bgBuffer.length;
                 const aiSample = i < aiSamples.length ? aiSamples[i] : 0;
-
-                // MIX
                 let mixed = aiSample + bgSample;
-
-                // CLAMP (Prevent distortion)
-                mixed = Math.max(-32768, Math.min(32767, mixed));
-
-                outputSamples[i] = mixed;
+                outputSamples[i] = Math.max(-32768, Math.min(32767, mixed));
             }
 
-            // 4. Encode to Mu-Law for Twilio (Using alawmulaw library)
+            // Encode using the NEW library
             const muLawSamples = alawmulaw.mulaw.encode(outputSamples);
-            const base64String = Buffer.from(muLawSamples).toString('base64');
+            sendAudioToTwilio(Buffer.from(muLawSamples).toString('base64'));
 
-            sendAudioToTwilio(base64String);
-
-        }, 20); // 20ms tick
+        }, 20);
     };
 
     ws.on('message', (message) => {
@@ -125,53 +97,42 @@ wss.on('connection', (ws) => {
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started! SID: ${streamSid}`);
-                
-                // Start the Mixer immediately
                 startMixer();
 
-                // Connect to ElevenLabs (Outputting u-law 8000Hz)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
                 });
 
                 elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
-                
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     if (aiMsg.audio_event?.audio_base64_chunk) {
-                        // DECODE Mu-Law -> Linear PCM for mixing
                         const rawAudio = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
+                        // Decode using NEW library
                         const pcmSamples = alawmulaw.mulaw.decode(rawAudio);
-                        
-                        // Add to Queue
-                        for (let i = 0; i < pcmSamples.length; i++) {
-                            aiAudioQueue.push(pcmSamples[i]);
-                        }
+                        for (let i = 0; i < pcmSamples.length; i++) aiAudioQueue.push(pcmSamples[i]);
                     }
                 });
-                
                 elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
                 elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // --- INPUT BOOST (The Silence Fix) ---
-                    // 1. Decode Twilio Mu-Law -> Linear PCM
                     const inputBuffer = Buffer.from(msg.media.payload, 'base64');
+                    // Decode using NEW library
                     const inputSamples = alawmulaw.mulaw.decode(inputBuffer);
-
-                    // 2. Boost Volume
+                    
                     for (let i = 0; i < inputSamples.length; i++) {
                         let boosted = inputSamples[i] * MIC_BOOST;
                         inputSamples[i] = Math.max(-32768, Math.min(32767, boosted));
                     }
-
-                    // 3. Re-encode to Mu-Law for ElevenLabs
+                    
+                    // Encode using NEW library
                     const boostedMuLaw = alawmulaw.mulaw.encode(inputSamples);
-                    const boostedBase64 = Buffer.from(boostedMuLaw).toString('base64');
-
-                    elevenLabsWs.send(JSON.stringify({ user_audio_chunk: boostedBase64 }));
+                    elevenLabsWs.send(JSON.stringify({ 
+                        user_audio_chunk: Buffer.from(boostedMuLaw).toString('base64') 
+                    }));
                 }
             } else if (msg.event === 'stop') {
                 if (elevenLabsWs) elevenLabsWs.close();
