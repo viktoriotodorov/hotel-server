@@ -1,4 +1,4 @@
-// index.js (Final Cloud: 16kHz + 500% Volume Boost)
+// index.js (Final Cloud: Turbo Low-Latency Mode)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Volume Boost Active"));
+app.get('/', (req, res) => res.send("Server Online: Turbo Mode Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -27,27 +27,18 @@ const wss = new WebSocket.Server({ server });
 
 // --- MU-LAW LOOKUP TABLE WITH VOLUME BOOST ---
 const muLawToLinearTable = new Int16Array(256);
-const VOLUME_BOOST = 5.0; // Amplify audio 5x (500%)
+const VOLUME_BOOST = 5.0; // Keep the volume loud
 
 for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; // Invert inputs
+    let muLawByte = ~i; 
     let sign = (muLawByte & 0x80) >> 7;
     let exponent = (muLawByte & 0x70) >> 4;
     let mantissa = muLawByte & 0x0F;
-    
-    // Standard conversion
     let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
-    
-    // Apply sign
     sample = sign === 0 ? -sample : sample;
-
-    // Apply Volume Boost
     sample = sample * VOLUME_BOOST;
-
-    // "Clamp" the values so they don't distort (stay within 16-bit limits)
     if (sample > 32767) sample = 32767;
     if (sample < -32768) sample = -32768;
-
     muLawToLinearTable[i] = sample;
 }
 
@@ -56,11 +47,9 @@ wss.on('connection', (ws) => {
     
     let elevenLabsWs = null;
     let streamSid = null;
-    
     let audioQueue = Buffer.alloc(0); 
     let isPlaying = false;
     let outputIntervalId = null;
-    
     let pcmInputQueue = Buffer.alloc(0);
     let lastInputSample = 0;
 
@@ -82,7 +71,6 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     
-                    // OUTPUT LOGIC
                     let chunkData = null;
                     if (aiMsg.audio_event) {
                         if (aiMsg.audio_event.audio_base64_chunk) {
@@ -105,7 +93,9 @@ wss.on('connection', (ws) => {
                         const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
 
-                        if (!isPlaying && audioQueue.length >= 4000) { 
+                        // TURBO CHANGE: Play almost immediately (wait for just 0.1s instead of 0.5s)
+                        // 800 bytes = 0.1 seconds of audio
+                        if (!isPlaying && audioQueue.length >= 800) { 
                             isPlaying = true;
                             outputIntervalId = setInterval(streamAudioToTwilio, 20);
                         }
@@ -117,27 +107,22 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // *** LINEAR INTERPOLATION + VOLUME BOOST ***
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        // The 'currentSample' is now 5x louder thanks to the table above
                         const currentSample = muLawToLinearTable[twilioChunk[i]];
-                        
-                        // Interpolate
                         const midPoint = Math.floor((lastInputSample + currentSample) / 2);
-                        
                         pcmChunk.writeInt16LE(midPoint, i * 4);
                         pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
-
                         lastInputSample = currentSample;
                     }
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
 
-                    const INPUT_THRESHOLD = 3200; 
-                    if (pcmInputQueue.length >= INPUT_THRESHOLD) {
+                    // TURBO CHANGE: Send faster (every 50ms instead of 100ms)
+                    // 1600 bytes = 50ms of 16kHz audio
+                    if (pcmInputQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({ 
                             user_audio_chunk: pcmInputQueue.toString('base64') 
                         }));
