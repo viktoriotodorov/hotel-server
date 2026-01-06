@@ -3,7 +3,7 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const mulaw = require('mu-law');
+const alawmulaw = require('alawmulaw'); // Updated Library
 
 const PORT = process.env.PORT || 3000;
 
@@ -27,7 +27,6 @@ try {
     
     // WAV Header Removal:
     // A standard WAV header is 44 bytes. We remove it to get raw audio samples.
-    // If we don't do this, the header plays as a loud "POP" or static at the start.
     const rawBuffer = fileData.subarray(44); 
     
     // Convert bytes to 16-bit integers (Linear PCM)
@@ -110,9 +109,9 @@ wss.on('connection', (ws) => {
                 outputSamples[i] = mixed;
             }
 
-            // 4. Encode to Mu-Law for Twilio
-            const muLawBuffer = mulaw.encode(outputSamples);
-            const base64String = Buffer.from(muLawBuffer.buffer).toString('base64');
+            // 4. Encode to Mu-Law for Twilio (Using alawmulaw library)
+            const muLawSamples = alawmulaw.mulaw.encode(outputSamples);
+            const base64String = Buffer.from(muLawSamples).toString('base64');
 
             sendAudioToTwilio(base64String);
 
@@ -143,7 +142,7 @@ wss.on('connection', (ws) => {
                     if (aiMsg.audio_event?.audio_base64_chunk) {
                         // DECODE Mu-Law -> Linear PCM for mixing
                         const rawAudio = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
-                        const pcmSamples = mulaw.decode(rawAudio);
+                        const pcmSamples = alawmulaw.mulaw.decode(rawAudio);
                         
                         // Add to Queue
                         for (let i = 0; i < pcmSamples.length; i++) {
@@ -160,7 +159,7 @@ wss.on('connection', (ws) => {
                     // --- INPUT BOOST (The Silence Fix) ---
                     // 1. Decode Twilio Mu-Law -> Linear PCM
                     const inputBuffer = Buffer.from(msg.media.payload, 'base64');
-                    const inputSamples = mulaw.decode(inputBuffer);
+                    const inputSamples = alawmulaw.mulaw.decode(inputBuffer);
 
                     // 2. Boost Volume
                     for (let i = 0; i < inputSamples.length; i++) {
@@ -169,8 +168,8 @@ wss.on('connection', (ws) => {
                     }
 
                     // 3. Re-encode to Mu-Law for ElevenLabs
-                    const boostedMuLaw = mulaw.encode(inputSamples);
-                    const boostedBase64 = Buffer.from(boostedMuLaw.buffer).toString('base64');
+                    const boostedMuLaw = alawmulaw.mulaw.encode(inputSamples);
+                    const boostedBase64 = Buffer.from(boostedMuLaw).toString('base64');
 
                     elevenLabsWs.send(JSON.stringify({ user_audio_chunk: boostedBase64 }));
                 }
