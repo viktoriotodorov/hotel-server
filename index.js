@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Auto-Ducking Mixer + 300% Output Boost)
+// index.js (Final Cloud: Golden Master Mixer)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Auto-Ducking Mixer Active"));
+app.get('/', (req, res) => res.send("Server Online: Golden Master Mixer Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -26,49 +26,26 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- CONFIGURATION ---
-const AI_OUTPUT_BOOST = 3.0;  // Boost AI Voice by 300% (Loud & Clear)
-const USER_INPUT_BOOST = 5.0; // Boost Your Voice by 500% (For Scribe)
-const MUSIC_VOL_LOW = 0.05;   // Music volume when AI is talking (5%)
-const MUSIC_VOL_HIGH = 0.10;  // Music volume when AI is silent (10%)
+// --- PERFECT LEVELS ---
+// We keep the AI at 100% (1.0) and the Background at 10% (0.1).
+// This guarantees no distortion (Clipping).
+const BG_VOLUME = 0.10;
+const AI_VOLUME = 1.0; 
+const MIC_BOOST = 3.0; // Boost YOUR voice for Scribe, not the AI output.
 
-// --- TABLE 1: OUTPUT DECODER (AI -> Phone) ---
-const muLawToLinearTable_Output = new Int16Array(256);
+// --- 1. DECODER (Mu-Law -> Linear PCM) ---
+const muLawToLinearTable = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; 
+    let muLawByte = ~i;
     let sign = (muLawByte & 0x80) >> 7;
     let exponent = (muLawByte & 0x70) >> 4;
     let mantissa = muLawByte & 0x0F;
     let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
     sample = sign === 0 ? -sample : sample;
-    
-    // APPLY 300% BOOST
-    sample = sample * AI_OUTPUT_BOOST;
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-    
-    muLawToLinearTable_Output[i] = sample;
+    muLawToLinearTable[i] = sample;
 }
 
-// --- TABLE 2: INPUT DECODER (Phone -> Scribe) ---
-const muLawToLinearTable_Input = new Int16Array(256);
-for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; 
-    let sign = (muLawByte & 0x80) >> 7;
-    let exponent = (muLawByte & 0x70) >> 4;
-    let mantissa = muLawByte & 0x0F;
-    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
-    sample = sign === 0 ? -sample : sample;
-    
-    // APPLY 500% BOOST
-    sample = sample * USER_INPUT_BOOST;
-    if (sample > 32767) sample = 32767;
-    if (sample < -32768) sample = -32768;
-    
-    muLawToLinearTable_Input[i] = sample;
-}
-
-// --- TABLE 3: ENCODER (Linear -> MuLaw) ---
+// --- 2. ENCODER (Linear PCM -> Mu-Law) ---
 const linearToMuLawTable = new Uint8Array(65536);
 const BIAS = 0x84;
 const CLIP = 32635;
@@ -82,10 +59,7 @@ for (let i = 0; i < 65536; i++) {
     let exponent = 7;
     let exponent_bits = 0;
     for (let exp = 0; exp < 8; exp++) {
-        if (sample < (1 << (exp + 5))) {
-            exponent = exp;
-            break;
-        }
+        if (sample < (1 << (exp + 5))) { exponent = exp; break; }
     }
     if (sample > 32767) sample = 32767;
     if (sample >= 32768) exponent_bits = 7;
@@ -100,7 +74,7 @@ for (let i = 0; i < 65536; i++) {
     linearToMuLawTable[i] = ~(sign | (exponent_bits << 4) | mantissa_bits) & 0xFF;
 }
 
-// --- BACKGROUND LOADER ---
+// --- BACKGROUND LOADER (16-bit PCM Storage) ---
 let backgroundBuffer = Buffer.alloc(0);
 console.log("[SYSTEM] Downloading Background Sound...");
 https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/lobby.wav", (res) => {
@@ -109,7 +83,8 @@ https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/l
     res.on('end', () => {
         const fullFile = Buffer.concat(data);
         if (fullFile.length > 100) {
-            backgroundBuffer = fullFile.subarray(44); 
+            // We strip the first 44 bytes (WAV Header) so we don't play a "click" sound
+            backgroundBuffer = fullFile.subarray(44);
             console.log(`[SYSTEM] Background Sound Loaded! (${backgroundBuffer.length} bytes)`);
         }
     });
@@ -121,9 +96,13 @@ wss.on('connection', (ws) => {
     
     let elevenLabsWs = null;
     let streamSid = null;
-    let audioQueue = Buffer.alloc(0); 
-    let pcmInputQueue = Buffer.alloc(0);
+    
+    // Audio Buffers
+    let aiAudioQueue = Buffer.alloc(0);     // AI Audio (Mu-Law)
+    let inputPcmQueue = Buffer.alloc(0);    // User Audio (PCM 16k)
     let lastInputSample = 0;
+    
+    // Mixer State
     let bgIndex = 0;
     let outputIntervalId = null;
 
@@ -135,6 +114,8 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started!`);
 
+                // 1. Connect to ElevenLabs (Standard 8k)
+                // This ensures the AI voice format matches the phone line perfectly.
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -142,6 +123,8 @@ wss.on('connection', (ws) => {
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
+                    // 2. Start the Heartbeat (20ms)
+                    // This runs forever, ensuring background music never pauses.
                     if (!outputIntervalId) {
                         outputIntervalId = setInterval(streamAudioToTwilio, 20);
                     }
@@ -149,27 +132,17 @@ wss.on('connection', (ws) => {
                 
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
-                    
+                    // SMART FINDER: Locates audio data wherever it hides
                     let chunkData = null;
-                    if (aiMsg.audio_event) {
-                        if (aiMsg.audio_event.audio_base64_chunk) {
-                            chunkData = aiMsg.audio_event.audio_base64_chunk;
-                        } else if (aiMsg.audio_event.audio) chunkData = aiMsg.audio_event.audio;
-                        else {
-                            const keys = Object.keys(aiMsg.audio_event);
-                            for (const key of keys) {
-                                const val = aiMsg.audio_event[key];
-                                if (typeof val === 'string' && val.length > 100) {
-                                    chunkData = val;
-                                    break;
-                                }
-                            }
-                        }
+                    if (aiMsg.audio_event?.audio_base64_chunk) {
+                        chunkData = aiMsg.audio_event.audio_base64_chunk;
+                    } else if (aiMsg.audio_event?.audio) {
+                         chunkData = aiMsg.audio_event.audio;
                     }
-
+                    
                     if (chunkData) {
                         const newChunk = Buffer.from(chunkData, 'base64');
-                        audioQueue = Buffer.concat([audioQueue, newChunk]);
+                        aiAudioQueue = Buffer.concat([aiAudioQueue, newChunk]);
                     }
                 });
 
@@ -178,26 +151,33 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // *** INPUT PROCESSING (USER -> AI) ***
-                    // Use the 500% Boosted Table for Scribe
+                    // *** INPUT LOGIC (USER -> SCRIBE) ***
+                    // We only boost YOUR voice. We do not touch the background/AI here.
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
-                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); // 8k -> 16k upsample
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        const currentSample = muLawToLinearTable_Input[twilioChunk[i]];
-                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        // Decode & Boost
+                        let sample = muLawToLinearTable[twilioChunk[i]];
+                        sample = sample * MIC_BOOST;
+                        if (sample > 32767) sample = 32767;
+                        if (sample < -32768) sample = -32768;
+
+                        // Linear Interpolation (Smoothing)
+                        const midPoint = Math.floor((lastInputSample + sample) / 2);
                         pcmChunk.writeInt16LE(midPoint, i * 4);
-                        pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
-                        lastInputSample = currentSample;
+                        pcmChunk.writeInt16LE(sample, i * 4 + 2);
+                        lastInputSample = sample;
                     }
 
-                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
-
-                    if (pcmInputQueue.length >= 1600) {
+                    inputPcmQueue = Buffer.concat([inputPcmQueue, pcmChunk]);
+                    
+                    // Send 100ms chunks to Scribe for stability
+                    if (inputPcmQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({ 
-                            user_audio_chunk: pcmInputQueue.toString('base64') 
+                            user_audio_chunk: inputPcmQueue.toString('base64') 
                         }));
-                        pcmInputQueue = Buffer.alloc(0);
+                        inputPcmQueue = Buffer.alloc(0);
                     }
                 }
             } else if (msg.event === 'stop') {
@@ -211,58 +191,54 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
-    // --- AUTO-DUCKING MIXER (AI -> USER) ---
+    // --- THE GOLDEN MIXER ---
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
+        // Twilio expects exactly 160 bytes (20ms of audio)
         const CHUNK_SIZE = 160; 
         const mixedBuffer = Buffer.alloc(CHUNK_SIZE);
-
-        let hasBackground = false;
-        if (backgroundBuffer.length > 0) hasBackground = true;
-
+        
+        let hasBackground = (backgroundBuffer.length > 0);
         let aiChunk = null;
-        // Check if AI is talking right now
-        const isAiTalking = audioQueue.length >= CHUNK_SIZE;
 
-        if (isAiTalking) {
-            aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
-            audioQueue = audioQueue.subarray(CHUNK_SIZE);
+        // Fetch AI Audio (if available)
+        if (aiAudioQueue.length >= CHUNK_SIZE) {
+            aiChunk = aiAudioQueue.subarray(0, CHUNK_SIZE);
+            aiAudioQueue = aiAudioQueue.subarray(CHUNK_SIZE);
         }
 
-        // Determine Music Volume Target
-        // If AI talks, set Low Volume. If AI silent, set High Volume.
-        const currentMusicVol = isAiTalking ? MUSIC_VOL_LOW : MUSIC_VOL_HIGH;
-
         for (let i = 0; i < CHUNK_SIZE; i++) {
-            let sample = 0;
+            let finalSample = 0;
 
+            // 1. Add Background
             if (hasBackground) {
-                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0;
+                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; // Loop
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                
-                // Mix Music
-                sample += (bgSample * currentMusicVol); 
+                finalSample += (bgSample * BG_VOLUME);
             }
 
+            // 2. Add AI Voice
             if (aiChunk) {
-                // Mix AI (Already boosted 300% by the table)
-                const aiSample = muLawToLinearTable_Output[aiChunk[i]];
-                sample += aiSample;
+                // Decode from Mu-Law
+                const aiSample = muLawToLinearTable[aiChunk[i]];
+                finalSample += (aiSample * AI_VOLUME);
             }
 
-            // Final Clamp (Prevent "Super Distortion")
-            if (sample > 32767) sample = 32767;
-            if (sample < -32768) sample = -32768;
+            // 3. Hard Clamp (Prevent Distortion)
+            if (finalSample > 32767) finalSample = 32767;
+            if (finalSample < -32768) finalSample = -32768;
 
-            let tableIndex = Math.floor(sample) + 32768;
+            // 4. Encode to Mu-Law
+            let tableIndex = Math.floor(finalSample) + 32768;
             if (tableIndex < 0) tableIndex = 0;
             if (tableIndex > 65535) tableIndex = 65535;
             
             mixedBuffer[i] = linearToMuLawTable[tableIndex];
         }
 
+        // Send the perfect packet
         ws.send(JSON.stringify({
             event: 'media',
             streamSid: streamSid,
