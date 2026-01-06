@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Bi-Directional Buffering)
+// index.js (Final Cloud: Input Decoding + Output Buffering)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Bi-Directional Buffering Active"));
+app.get('/', (req, res) => res.send("Server Online: Audio Transcoding Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -25,6 +25,19 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// --- MU-LAW DECODING LOGIC ---
+// We convert 8-bit Mu-Law (Telephone) to 16-bit PCM (Computer)
+// This fixes the "Weak/Distorted" voice issue.
+const muLawToLinear = (muLawByte) => {
+    const BIAS = 0x84;
+    let sign = (muLawByte & 0x80) >> 7;
+    let exponent = (muLawByte & 0x70) >> 4;
+    let mantissa = muLawByte & 0x0F;
+    let sample = (2 * (mantissa) + 33) * (1 << exponent);
+    sample -= BIAS;
+    return sign === 0 ? sample : -sample;
+};
+
 wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
     
@@ -37,7 +50,7 @@ wss.on('connection', (ws) => {
     let outputIntervalId = null;
 
     // INPUT BUFFER (Phone -> AI)
-    let userAudioQueue = Buffer.alloc(0);
+    let pcmInputQueue = Buffer.alloc(0);
 
     ws.on('message', (message) => {
         try {
@@ -48,6 +61,7 @@ wss.on('connection', (ws) => {
                 console.log(`[TWILIO] Stream Started!`);
 
                 // 1. Connect to ElevenLabs
+                // We KEEP output as ulaw_8000 because Twilio handles that fine.
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -58,7 +72,7 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     
-                    // SMART FINDER LOGIC (For AI Audio)
+                    // OUTPUT LOGIC (Keep exactly what worked)
                     let chunkData = null;
                     if (aiMsg.audio_event) {
                         if (aiMsg.audio_event.audio_base64_chunk) {
@@ -66,7 +80,6 @@ wss.on('connection', (ws) => {
                         } else if (aiMsg.audio_event.audio) {
                             chunkData = aiMsg.audio_event.audio;
                         } else {
-                            // Brute force find string
                             const keys = Object.keys(aiMsg.audio_event);
                             for (const key of keys) {
                                 const val = aiMsg.audio_event[key];
@@ -82,8 +95,7 @@ wss.on('connection', (ws) => {
                         const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
 
-                        if (!isPlaying && audioQueue.length >= 4000) { // 0.5s buffer
-                            console.log("[SYSTEM] Output Dam Full - Playing Audio!");
+                        if (!isPlaying && audioQueue.length >= 4000) { 
                             isPlaying = true;
                             outputIntervalId = setInterval(streamAudioToTwilio, 20);
                         }
@@ -91,28 +103,31 @@ wss.on('connection', (ws) => {
                 });
 
                 elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
-                elevenLabsWs.on('close', () => {
-                    console.log("[11LABS] Disconnected");
-                });
+                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
-                // *** NEW: INPUT BUFFERING (Phone -> AI) ***
-                // Instead of sending immediately, we collect data.
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    const userChunk = Buffer.from(msg.media.payload, 'base64');
-                    userAudioQueue = Buffer.concat([userAudioQueue, userChunk]);
+                    // *** 2. DECODE TWILIO AUDIO ***
+                    // Twilio sends Mu-Law (base64). We decode it to raw PCM.
+                    const twilioChunk = Buffer.from(msg.media.payload, 'base64');
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 2); // PCM is 16-bit (2 bytes) per sample
 
-                    // Wait until we have 100ms of audio (800 bytes for ulaw-8000)
-                    // This creates cleaner packets for Scribe to understand.
-                    const BUFFER_THRESHOLD = 800; 
-                    
-                    if (userAudioQueue.length >= BUFFER_THRESHOLD) {
-                        // Send the big chunk
+                    for (let i = 0; i < twilioChunk.length; i++) {
+                        const pcmSample = muLawToLinear(twilioChunk[i]);
+                        pcmChunk.writeInt16LE(pcmSample, i * 2);
+                    }
+
+                    // Buffer the PCM data
+                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
+
+                    // Send 100ms chunks (PCM 8000Hz 16-bit = 1600 bytes per 100ms)
+                    const INPUT_THRESHOLD = 1600; 
+
+                    if (pcmInputQueue.length >= INPUT_THRESHOLD) {
                         elevenLabsWs.send(JSON.stringify({ 
-                            user_audio_chunk: userAudioQueue.toString('base64') 
+                            user_audio_chunk: pcmInputQueue.toString('base64') 
                         }));
-                        // Clear the buffer
-                        userAudioQueue = Buffer.alloc(0);
+                        pcmInputQueue = Buffer.alloc(0);
                     }
                 }
             } else if (msg.event === 'stop') {
@@ -126,7 +141,6 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
-    // OUTPUT STREAMER (AI -> Phone)
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         const CHUNK_SIZE = 160; 
