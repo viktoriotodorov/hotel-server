@@ -3,7 +3,7 @@ const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const alawmulaw = require('alawmulaw'); // <--- THIS IS THE FIX
+const alawmulaw = require('alawmulaw'); 
 
 const PORT = process.env.PORT || 3000;
 
@@ -30,12 +30,19 @@ try {
 }
 
 const app = express();
+
+// --- CRITICAL FIX: PARSE TWILIO DATA ---
+app.use(express.urlencoded({ extended: true }));
+// ---------------------------------------
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 app.get('/', (req, res) => res.send('Split-Reality Server is Online'));
 
 app.post('/incoming-call', (req, res) => {
+    // This line crashed before because 'req.body' was undefined. 
+    // The fix above solves this.
     const callerId = req.body.From || "Unknown";
     console.log(`[TWILIO] Call from: ${callerId}`);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -83,7 +90,7 @@ wss.on('connection', (ws) => {
                 outputSamples[i] = Math.max(-32768, Math.min(32767, mixed));
             }
 
-            // Encode using the NEW library
+            // Encode using alawmulaw
             const muLawSamples = alawmulaw.mulaw.encode(outputSamples);
             sendAudioToTwilio(Buffer.from(muLawSamples).toString('base64'));
 
@@ -109,7 +116,6 @@ wss.on('connection', (ws) => {
                     const aiMsg = JSON.parse(data);
                     if (aiMsg.audio_event?.audio_base64_chunk) {
                         const rawAudio = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
-                        // Decode using NEW library
                         const pcmSamples = alawmulaw.mulaw.decode(rawAudio);
                         for (let i = 0; i < pcmSamples.length; i++) aiAudioQueue.push(pcmSamples[i]);
                     }
@@ -120,7 +126,6 @@ wss.on('connection', (ws) => {
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const inputBuffer = Buffer.from(msg.media.payload, 'base64');
-                    // Decode using NEW library
                     const inputSamples = alawmulaw.mulaw.decode(inputBuffer);
                     
                     for (let i = 0; i < inputSamples.length; i++) {
@@ -128,7 +133,6 @@ wss.on('connection', (ws) => {
                         inputSamples[i] = Math.max(-32768, Math.min(32767, boosted));
                     }
                     
-                    // Encode using NEW library
                     const boostedMuLaw = alawmulaw.mulaw.encode(inputSamples);
                     elevenLabsWs.send(JSON.stringify({ 
                         user_audio_chunk: Buffer.from(boostedMuLaw).toString('base64') 
