@@ -1,4 +1,4 @@
-// index.js (Cloud: The Packetizer)
+// index.js (Cloud: The Safety Dam)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Packetizer Active"));
+app.get('/', (req, res) => res.send("Server Online: Safety Dam Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -30,7 +30,8 @@ wss.on('connection', (ws) => {
     
     let elevenLabsWs = null;
     let streamSid = null;
-    let audioQueue = Buffer.alloc(0); // The Bucket
+    let audioQueue = Buffer.alloc(0); 
+    let isPlaying = false;
     let intervalId = null;
 
     ws.on('message', (message) => {
@@ -47,26 +48,30 @@ wss.on('connection', (ws) => {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
                 });
 
-                elevenLabsWs.on('open', () => {
-                    console.log("[11LABS] Connected");
-                    // 2. Start the Timer (The "Beep" Logic)
-                    // Every 20ms, take exactly 160 bytes and send it.
-                    intervalId = setInterval(streamAudioToTwilio, 20);
-                });
+                elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
                 
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     if (aiMsg.audio_event?.audio_base64_chunk) {
-                        // 3. Receive Big Chunk & Add to Bucket
+                        // 2. FILL THE DAM
                         const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
+
+                        // 3. OPEN THE FLOODGATES
+                        // Wait until we have 3200 bytes (approx 0.4 seconds) of audio before starting.
+                        // This prevents the "Silence" bug where the stream runs dry.
+                        if (!isPlaying && audioQueue.length >= 3200) {
+                            console.log("[SYSTEM] Dam Full - Starting Playback...");
+                            isPlaying = true;
+                            intervalId = setInterval(streamAudioToTwilio, 20);
+                        }
                     }
                 });
 
                 elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
                 elevenLabsWs.on('close', () => {
                     console.log("[11LABS] Disconnected");
-                    clearInterval(intervalId);
+                    // Don't clear interval immediately; let the buffer finish playing
                 });
 
             } else if (msg.event === 'media') {
@@ -84,14 +89,13 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(intervalId));
 
-    // THE PACKETIZER FUNCTION
-    // This makes the AI audio look exactly like the "Beep" to Twilio
+    // THE STREAMER
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
 
-        const CHUNK_SIZE = 160; // 20ms of u-law audio
+        const CHUNK_SIZE = 160; // 20ms
 
-        // If we have audio in the bucket, pour a spoonful
+        // If we have audio, send it.
         if (audioQueue.length >= CHUNK_SIZE) {
             const chunkToSend = audioQueue.subarray(0, CHUNK_SIZE);
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
@@ -101,6 +105,9 @@ wss.on('connection', (ws) => {
                 streamSid: streamSid,
                 media: { payload: chunkToSend.toString('base64') }
             }));
+        } else {
+            // If the dam runs dry, we stop sending but keep the timer running checking for more water
+            // console.log("Buffering...");
         }
     }
 });
