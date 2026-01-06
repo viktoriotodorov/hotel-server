@@ -1,4 +1,4 @@
-// index.js (Cloud: Smart-Finder & Safety Dam)
+// index.js (Final Cloud: Bi-Directional Buffering)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Smart-Finder Active"));
+app.get('/', (req, res) => res.send("Server Online: Bi-Directional Buffering Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -30,9 +30,14 @@ wss.on('connection', (ws) => {
     
     let elevenLabsWs = null;
     let streamSid = null;
+    
+    // OUTPUT BUFFER (AI -> Phone)
     let audioQueue = Buffer.alloc(0); 
     let isPlaying = false;
-    let intervalId = null;
+    let outputIntervalId = null;
+
+    // INPUT BUFFER (Phone -> AI)
+    let userAudioQueue = Buffer.alloc(0);
 
     ws.on('message', (message) => {
         try {
@@ -53,21 +58,15 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     
-                    // *** SMART FINDER LOGIC ***
-                    // We don't know the exact key name, so we look for it.
+                    // SMART FINDER LOGIC (For AI Audio)
                     let chunkData = null;
-
                     if (aiMsg.audio_event) {
-                        // Log the keys so we can see the real name for next time
-                        // console.log(`[DEBUG] Keys in audio_event: ${Object.keys(aiMsg.audio_event)}`);
-
-                        // Check common names
                         if (aiMsg.audio_event.audio_base64_chunk) {
                             chunkData = aiMsg.audio_event.audio_base64_chunk;
                         } else if (aiMsg.audio_event.audio) {
                             chunkData = aiMsg.audio_event.audio;
                         } else {
-                            // Brute Force: Find any value that is a long string (audio data)
+                            // Brute force find string
                             const keys = Object.keys(aiMsg.audio_event);
                             for (const key of keys) {
                                 const val = aiMsg.audio_event[key];
@@ -80,15 +79,13 @@ wss.on('connection', (ws) => {
                     }
 
                     if (chunkData) {
-                        // 2. FILL THE DAM
                         const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
 
-                        // 3. OPEN THE FLOODGATES (Buffer 0.5s to prevent silence)
-                        if (!isPlaying && audioQueue.length >= 4000) {
-                            console.log("[SYSTEM] Dam Full - Playing Audio!");
+                        if (!isPlaying && audioQueue.length >= 4000) { // 0.5s buffer
+                            console.log("[SYSTEM] Output Dam Full - Playing Audio!");
                             isPlaying = true;
-                            intervalId = setInterval(streamAudioToTwilio, 20);
+                            outputIntervalId = setInterval(streamAudioToTwilio, 20);
                         }
                     }
                 });
@@ -99,30 +96,43 @@ wss.on('connection', (ws) => {
                 });
 
             } else if (msg.event === 'media') {
+                // *** NEW: INPUT BUFFERING (Phone -> AI) ***
+                // Instead of sending immediately, we collect data.
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    elevenLabsWs.send(JSON.stringify({ user_audio_chunk: msg.media.payload }));
+                    const userChunk = Buffer.from(msg.media.payload, 'base64');
+                    userAudioQueue = Buffer.concat([userAudioQueue, userChunk]);
+
+                    // Wait until we have 100ms of audio (800 bytes for ulaw-8000)
+                    // This creates cleaner packets for Scribe to understand.
+                    const BUFFER_THRESHOLD = 800; 
+                    
+                    if (userAudioQueue.length >= BUFFER_THRESHOLD) {
+                        // Send the big chunk
+                        elevenLabsWs.send(JSON.stringify({ 
+                            user_audio_chunk: userAudioQueue.toString('base64') 
+                        }));
+                        // Clear the buffer
+                        userAudioQueue = Buffer.alloc(0);
+                    }
                 }
             } else if (msg.event === 'stop') {
                 if (elevenLabsWs) elevenLabsWs.close();
-                clearInterval(intervalId);
+                clearInterval(outputIntervalId);
             }
         } catch (e) {
             console.error(e);
         }
     });
 
-    ws.on('close', () => clearInterval(intervalId));
+    ws.on('close', () => clearInterval(outputIntervalId));
 
-    // THE STREAMER
+    // OUTPUT STREAMER (AI -> Phone)
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
-
         const CHUNK_SIZE = 160; 
-
         if (audioQueue.length >= CHUNK_SIZE) {
             const chunkToSend = audioQueue.subarray(0, CHUNK_SIZE);
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
-
             ws.send(JSON.stringify({
                 event: 'media',
                 streamSid: streamSid,
