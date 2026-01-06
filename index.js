@@ -1,22 +1,30 @@
-// index.js (Cloud Direct Mode - No Buffering)
+// index.js (Cloud Beep Diagnostic)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 
-// Render sets this automatically
 const PORT = process.env.PORT || 3000;
-
-// Validate Environment Variables
-if (!process.env.ELEVENLABS_API_KEY || !process.env.AGENT_ID) {
-    console.error("ERROR: Missing Environment Variables");
-    process.exit(1);
-}
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// Browser Check
-app.get('/', (req, res) => res.send("Server is Online - Direct Mode"));
+app.get('/', (req, res) => res.send("Cloud Beep Server Online"));
+
+// Generate 1 Second of u-law Beep (Mathematical)
+const createBeep = () => {
+    const frequency = 440; 
+    const sampleRate = 8000;
+    const buffer = Buffer.alloc(sampleRate); 
+    for (let i = 0; i < buffer.length; i++) {
+        const t = i / sampleRate;
+        const sample = Math.sin(2 * Math.PI * frequency * t);
+        const s = Math.max(-1, Math.min(1, sample));
+        const ulaw = Math.sign(s) * (Math.log(1 + 255 * Math.abs(s)) / Math.log(256));
+        buffer[i] = (ulaw * 127 + 128); 
+    }
+    return buffer;
+};
+const beepBuffer = createBeep();
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -24,9 +32,7 @@ app.post('/incoming-call', (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
         <Connect>
-          <Stream url="wss://${req.headers.host}/media-stream">
-            <Parameter name="caller_id" value="${callerId}" />
-          </Stream>
+          <Stream url="wss://${req.headers.host}/media-stream" />
         </Connect>
       </Response>`;
     res.type('text/xml').send(twiml);
@@ -36,56 +42,33 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-    console.log("[TWILIO] Client Connected");
-    let elevenLabsWs = null;
-    let streamSid = null;
+    console.log("[TWILIO] Connected");
+    let intervalId = null;
+    let index = 0;
 
     ws.on('message', (message) => {
-        try {
-            const msg = JSON.parse(message);
-
-            if (msg.event === 'start') {
-                streamSid = msg.start.streamSid;
-                console.log(`[TWILIO] Stream Started! SID: ${streamSid}`);
-
-                // Connect to ElevenLabs
-                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
-                elevenLabsWs = new WebSocket(url, {
-                    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
-                });
-
-                elevenLabsWs.on('open', () => console.log("[11LABS] Connected to Cloud"));
+        const msg = JSON.parse(message);
+        if (msg.event === 'start') {
+            console.log(`[TWILIO] Stream Started! Sending Beep...`);
+            intervalId = setInterval(() => {
+                if (ws.readyState !== WebSocket.OPEN) return clearInterval(intervalId);
                 
-                elevenLabsWs.on('message', (data) => {
-                    const aiMsg = JSON.parse(data);
-                    if (aiMsg.audio_event?.audio_base64_chunk) {
-                        // LOGGING: Prove we received data
-                        // console.log("[11LABS] Received Audio Chunk"); 
-                        
-                        // DIRECT PASS-THROUGH (No Buffer)
-                        const payload = {
-                            event: 'media',
-                            streamSid: streamSid,
-                            media: { payload: aiMsg.audio_event.audio_base64_chunk }
-                        };
-                        ws.send(JSON.stringify(payload));
-                    }
-                });
+                // Send 20ms (160 bytes) chunks
+                const chunk = beepBuffer.subarray(index, index + 160);
+                index = (index + 160) % beepBuffer.length; 
 
-                elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
-                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
-
-            } else if (msg.event === 'media') {
-                if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    elevenLabsWs.send(JSON.stringify({ user_audio_chunk: msg.media.payload }));
-                }
-            } else if (msg.event === 'stop') {
-                if (elevenLabsWs) elevenLabsWs.close();
-            }
-        } catch (e) {
-            console.error(e);
+                ws.send(JSON.stringify({
+                    event: 'media',
+                    streamSid: msg.start.streamSid,
+                    media: { payload: chunk.toString('base64') }
+                }));
+            }, 20);
+        } else if (msg.event === 'stop') {
+            clearInterval(intervalId);
         }
     });
+
+    ws.on('close', () => clearInterval(intervalId));
 });
 
-server.listen(PORT, () => console.log(`[SYSTEM] Direct Server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`[SYSTEM] Beep Server listening on port ${PORT}`));
