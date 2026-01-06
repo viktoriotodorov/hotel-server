@@ -226,3 +226,25 @@ wss.on('connection', (ws) => {
             }
 
             // 3. Clamp (Prevents Distortion)
+            if (finalSample > 32767) finalSample = 32767;
+            if (finalSample < -32768) finalSample = -32768;
+
+            // 4. Encode Linear -> MuLaw
+            // Adjust to 0-65535 range for table lookup
+            let tableIndex = Math.floor(finalSample) + 32768;
+            if (tableIndex < 0) tableIndex = 0;
+            if (tableIndex > 65535) tableIndex = 65535;
+            
+            mixedBuffer[i] = linearToMuLawTable[tableIndex];
+        }
+
+        // Send Packet
+        ws.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: mixedBuffer.toString('base64') }
+        }));
+    }
+});
+
+server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
