@@ -1,4 +1,4 @@
-// index.js (Final Cloud: HD Upsampling 16kHz)
+// index.js (Final Cloud: Linear Interpolation 16kHz)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: 16kHz Upsampling Active"));
+app.get('/', (req, res) => res.send("Server Online: Linear Interpolation Active"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -25,26 +25,29 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- MU-LAW DECODING LOGIC ---
-const muLawToLinear = (muLawByte) => {
-    const BIAS = 0x84;
+// --- MU-LAW LOOKUP TABLE (Pre-calculated for Speed & Accuracy) ---
+const muLawToLinearTable = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+    let muLawByte = ~i; // Invert inputs
     let sign = (muLawByte & 0x80) >> 7;
     let exponent = (muLawByte & 0x70) >> 4;
     let mantissa = muLawByte & 0x0F;
-    let sample = (2 * (mantissa) + 33) * (1 << exponent);
-    sample -= BIAS;
-    return sign === 0 ? sample : -sample;
-};
+    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
+    muLawToLinearTable[i] = sign === 0 ? -sample : sample;
+}
 
 wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
     
     let elevenLabsWs = null;
     let streamSid = null;
+    
     let audioQueue = Buffer.alloc(0); 
     let isPlaying = false;
     let outputIntervalId = null;
+    
     let pcmInputQueue = Buffer.alloc(0);
+    let lastInputSample = 0; // Memory for interpolation
 
     ws.on('message', (message) => {
         try {
@@ -54,8 +57,6 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started!`);
 
-                // Connect to ElevenLabs
-                // Output is still ulaw_8000 (Phone standard)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -101,26 +102,30 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // *** 16kHz UPSAMPLING LOGIC ***
+                    // *** LINEAR INTERPOLATION (SMOOTH UPSAMPLING) ***
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
-                    
-                    // We need 4 bytes output for every 1 byte input
-                    // (1 byte -> 1 sample (2 bytes) -> Double it (4 bytes))
-                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); // 8k -> 16k (4 bytes per input byte)
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        const pcmSample = muLawToLinear(twilioChunk[i]);
-                        // Write the sample TWICE to upsample 8k -> 16k
-                        const offset = i * 4;
-                        pcmChunk.writeInt16LE(pcmSample, offset);
-                        pcmChunk.writeInt16LE(pcmSample, offset + 2);
+                        const currentSample = muLawToLinearTable[twilioChunk[i]];
+                        
+                        // Point A (Interpolated between last and current)
+                        // This effectively draws a smooth line
+                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        
+                        // Write Sample 1 (The Midpoint)
+                        pcmChunk.writeInt16LE(midPoint, i * 4);
+                        
+                        // Write Sample 2 (The Real Point)
+                        pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
+
+                        lastInputSample = currentSample;
                     }
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
 
-                    // Send chunks of approx 100ms (16kHz * 2 bytes * 0.1s = 3200 bytes)
+                    // Send chunks of approx 100ms
                     const INPUT_THRESHOLD = 3200; 
-
                     if (pcmInputQueue.length >= INPUT_THRESHOLD) {
                         elevenLabsWs.send(JSON.stringify({ 
                             user_audio_chunk: pcmInputQueue.toString('base64') 
