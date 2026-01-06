@@ -1,7 +1,7 @@
 {
-  "name": "hotel-ai-server",
+  "name": "twilio-media-stream",
   "version": "1.0.0",
-  "description": "ElevenLabs Twilio Server",
+  "description": "Twilio Media Stream with Split Reality Audio",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,7 +9,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.13.0",
-    "dotenv": "^16.0.3"
+    "mu-law": "^3.0.1"
   },
   "engines": {
     "node": ">=16.0.0"
