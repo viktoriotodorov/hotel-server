@@ -1,4 +1,4 @@
-// index.js (Cloud: The Safety Dam)
+// index.js (The "Sherlock Holmes" Logger)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Safety Dam Active"));
+app.get('/', (req, res) => res.send("Logger Online"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -27,12 +27,8 @@ const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
-    
     let elevenLabsWs = null;
     let streamSid = null;
-    let audioQueue = Buffer.alloc(0); 
-    let isPlaying = false;
-    let intervalId = null;
 
     ws.on('message', (message) => {
         try {
@@ -40,9 +36,9 @@ wss.on('connection', (ws) => {
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log(`[TWILIO] Stream Started!`);
+                console.log(`[TWILIO] Stream Started! SID: ${streamSid}`);
 
-                // 1. Connect to ElevenLabs
+                // Connect to ElevenLabs
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -51,28 +47,41 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
                 
                 elevenLabsWs.on('message', (data) => {
-                    const aiMsg = JSON.parse(data);
-                    if (aiMsg.audio_event?.audio_base64_chunk) {
-                        // 2. FILL THE DAM
-                        const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
-                        audioQueue = Buffer.concat([audioQueue, newChunk]);
-
-                        // 3. OPEN THE FLOODGATES
-                        // Wait until we have 3200 bytes (approx 0.4 seconds) of audio before starting.
-                        // This prevents the "Silence" bug where the stream runs dry.
-                        if (!isPlaying && audioQueue.length >= 3200) {
-                            console.log("[SYSTEM] Dam Full - Starting Playback...");
-                            isPlaying = true;
-                            intervalId = setInterval(streamAudioToTwilio, 20);
+                    // *** DIAGNOSTIC LOGGING ***
+                    // We will print the KEYS of the message to see the structure
+                    try {
+                        const aiMsg = JSON.parse(data);
+                        const keys = Object.keys(aiMsg);
+                        console.log(`[11LABS MSG] Type: ${aiMsg.type} | Keys: ${JSON.stringify(keys)}`);
+                        
+                        // If there is an 'audio_event', inspect it deeper
+                        if (aiMsg.audio_event) {
+                             console.log(`[11LABS AUDIO] Chunk Size: ${aiMsg.audio_event.audio_base64_chunk ? aiMsg.audio_event.audio_base64_chunk.length : 'NULL'}`);
                         }
+
+                        // Try to find audio ANYWHERE and send it
+                        let chunk = null;
+                        if (aiMsg.audio_event?.audio_base64_chunk) {
+                            chunk = aiMsg.audio_event.audio_base64_chunk;
+                        } else if (aiMsg.audio) {
+                            chunk = aiMsg.audio;
+                        }
+
+                        if (chunk) {
+                            const payload = {
+                                event: 'media',
+                                streamSid: streamSid,
+                                media: { payload: chunk }
+                            };
+                            ws.send(JSON.stringify(payload));
+                        }
+                    } catch (err) {
+                        console.log(`[11LABS RAW] Not JSON: ${data.toString().substring(0, 50)}...`);
                     }
                 });
 
                 elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
-                elevenLabsWs.on('close', () => {
-                    console.log("[11LABS] Disconnected");
-                    // Don't clear interval immediately; let the buffer finish playing
-                });
+                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
@@ -80,36 +89,11 @@ wss.on('connection', (ws) => {
                 }
             } else if (msg.event === 'stop') {
                 if (elevenLabsWs) elevenLabsWs.close();
-                clearInterval(intervalId);
             }
         } catch (e) {
             console.error(e);
         }
     });
-
-    ws.on('close', () => clearInterval(intervalId));
-
-    // THE STREAMER
-    function streamAudioToTwilio() {
-        if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
-
-        const CHUNK_SIZE = 160; // 20ms
-
-        // If we have audio, send it.
-        if (audioQueue.length >= CHUNK_SIZE) {
-            const chunkToSend = audioQueue.subarray(0, CHUNK_SIZE);
-            audioQueue = audioQueue.subarray(CHUNK_SIZE);
-
-            ws.send(JSON.stringify({
-                event: 'media',
-                streamSid: streamSid,
-                media: { payload: chunkToSend.toString('base64') }
-            }));
-        } else {
-            // If the dam runs dry, we stop sending but keep the timer running checking for more water
-            // console.log("Buffering...");
-        }
-    }
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
