@@ -8,10 +8,10 @@ const alawmulaw = require('alawmulaw');
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-const MIC_BOOST = 5.0; 
-const BG_VOLUME = 0.2; 
+const BG_VOLUME = 0.05; // Reduced to 5% (was 20%)
 const CHUNK_SIZE = 160; 
 
+// Validate Environment Variables
 if (!process.env.ELEVENLABS_API_KEY || !process.env.AGENT_ID) {
     console.error("[SYSTEM] ERROR: Missing Environment Variables");
     process.exit(1);
@@ -22,6 +22,7 @@ let bgBuffer = null;
 try {
     const filePath = path.join(__dirname, 'background.wav');
     const fileData = fs.readFileSync(filePath);
+    // REMINDER: Ensure your file is S16LE (16-bit), 8000Hz, Mono!
     const rawBuffer = fileData.subarray(44); 
     bgBuffer = new Int16Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.length / 2);
     console.log(`[SYSTEM] Background audio loaded: ${bgBuffer.length} samples`);
@@ -31,9 +32,8 @@ try {
 
 const app = express();
 
-// --- CRITICAL FIX: PARSE TWILIO DATA ---
+// Parse Twilio Data
 app.use(express.urlencoded({ extended: true }));
-// ---------------------------------------
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -41,8 +41,6 @@ const wss = new WebSocket.Server({ server });
 app.get('/', (req, res) => res.send('Split-Reality Server is Online'));
 
 app.post('/incoming-call', (req, res) => {
-    // This line crashed before because 'req.body' was undefined. 
-    // The fix above solves this.
     const callerId = req.body.From || "Unknown";
     console.log(`[TWILIO] Call from: ${callerId}`);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -83,14 +81,20 @@ wss.on('connection', (ws) => {
             const aiSamples = aiAudioQueue.splice(0, CHUNK_SIZE);
 
             for (let i = 0; i < CHUNK_SIZE; i++) {
+                // Mix Background + AI
                 const bgSample = bgBuffer[bgIndex] * BG_VOLUME;
                 bgIndex = (bgIndex + 1) % bgBuffer.length;
+                
+                // If AI has audio, use it. Otherwise 0.
                 const aiSample = i < aiSamples.length ? aiSamples[i] : 0;
+                
                 let mixed = aiSample + bgSample;
+                
+                // Prevent Distortion
                 outputSamples[i] = Math.max(-32768, Math.min(32767, mixed));
             }
 
-            // Encode using alawmulaw
+            // Encode output to phone
             const muLawSamples = alawmulaw.mulaw.encode(outputSamples);
             sendAudioToTwilio(Buffer.from(muLawSamples).toString('base64'));
 
@@ -104,7 +108,8 @@ wss.on('connection', (ws) => {
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started! SID: ${streamSid}`);
-                startMixer();
+                
+                startMixer(); 
 
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
@@ -115,6 +120,7 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     if (aiMsg.audio_event?.audio_base64_chunk) {
+                        // Decode AI audio and put in queue
                         const rawAudio = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
                         const pcmSamples = alawmulaw.mulaw.decode(rawAudio);
                         for (let i = 0; i < pcmSamples.length; i++) aiAudioQueue.push(pcmSamples[i]);
@@ -125,17 +131,11 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    const inputBuffer = Buffer.from(msg.media.payload, 'base64');
-                    const inputSamples = alawmulaw.mulaw.decode(inputBuffer);
-                    
-                    for (let i = 0; i < inputSamples.length; i++) {
-                        let boosted = inputSamples[i] * MIC_BOOST;
-                        inputSamples[i] = Math.max(-32768, Math.min(32767, boosted));
-                    }
-                    
-                    const boostedMuLaw = alawmulaw.mulaw.encode(inputSamples);
+                    // --- PASS-THROUGH (No Boost) ---
+                    // We send the data exactly as Twilio sent it. 
+                    // This guarantees the AI hears clean audio (no static).
                     elevenLabsWs.send(JSON.stringify({ 
-                        user_audio_chunk: Buffer.from(boostedMuLaw).toString('base64') 
+                        user_audio_chunk: msg.media.payload 
                     }));
                 }
             } else if (msg.event === 'stop') {
