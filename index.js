@@ -1,4 +1,4 @@
-// index.js (Final Cloud: Linear PCM High-Fidelity Mixer)
+// index.js (Final Cloud: Rock-Solid Mixer)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Server Online: Linear PCM Mixer Active"));
+app.get('/', (req, res) => res.send("Server Online: Unbreakable Mixer"));
 
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
@@ -27,31 +27,22 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // --- CONFIGURATION ---
-const BG_VOLUME = 0.10;   // Background Volume (10%)
-const AI_VOLUME = 1.0;    // AI Volume (100% - No Boost needed for PCM)
-const INPUT_BOOST = 3.0;  // Microphone Boost (300% for Scribe)
+const BG_VOLUME = 0.10;   // 10% Background (Subtle)
+const AI_VOLUME = 1.0;    // 100% AI Volume (Standard)
+const MIC_BOOST = 3.0;    // 300% Input Boost (For Scribe)
 
-// --- 1. TABLES (For Input Processing Only) ---
-// We only need MuLaw decoder for YOUR voice. 
-// The AI will now send us RAW PCM, so we don't need to decode it.
+// --- 1. TABLES (Standard G.711) ---
 const muLawToLinearTable = new Int16Array(256);
 for (let i = 0; i < 256; i++) {
-    let muLawByte = ~i; 
+    let muLawByte = ~i;
     let sign = (muLawByte & 0x80) >> 7;
     let exponent = (muLawByte & 0x70) >> 4;
     let mantissa = muLawByte & 0x0F;
     let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
     sample = sign === 0 ? -sample : sample;
-    
-    // Apply Input Boost here
-    let boosted = sample * INPUT_BOOST;
-    if (boosted > 32767) boosted = 32767;
-    if (boosted < -32768) boosted = -32768;
-    muLawToLinearTable[i] = boosted;
+    muLawToLinearTable[i] = sample;
 }
 
-// --- 2. ENCODER (Linear -> MuLaw) ---
-// Used for the final mix sent to Twilio
 const linearToMuLawTable = new Uint8Array(65536);
 const BIAS = 0x84;
 const CLIP = 32635;
@@ -81,7 +72,7 @@ for (let i = 0; i < 65536; i++) {
 }
 
 // --- BACKGROUND LOADER ---
-// Must be S16LE 8000Hz Mono WAV
+// Downloads lobby.wav and stores it as raw PCM 16-bit
 let backgroundBuffer = Buffer.alloc(0);
 console.log("[SYSTEM] Downloading Background Sound...");
 https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/lobby.wav", (res) => {
@@ -90,7 +81,8 @@ https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/l
     res.on('end', () => {
         const fullFile = Buffer.concat(data);
         if (fullFile.length > 100) {
-            backgroundBuffer = fullFile.subarray(44); // Skip WAV Header
+            // Strip WAV header (approx 44 bytes) to avoid static click at start
+            backgroundBuffer = fullFile.subarray(44); 
             console.log(`[SYSTEM] Background Sound Loaded! (${backgroundBuffer.length} bytes)`);
         }
     });
@@ -104,10 +96,11 @@ wss.on('connection', (ws) => {
     let streamSid = null;
     
     // Buffers
-    let aiPcmQueue = Buffer.alloc(0);     // 16kHz PCM from AI
-    let inputPcmQueue = Buffer.alloc(0);  // 16kHz PCM to Scribe
+    let audioQueue = Buffer.alloc(0);      // AI Audio (MuLaw)
+    let pcmInputQueue = Buffer.alloc(0);   // User Mic (PCM)
+    let lastInputSample = 0;               // For Upsampling
     
-    let lastInputSample = 0;
+    // Mixer State
     let bgIndex = 0;
     let outputIntervalId = null;
 
@@ -119,16 +112,16 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started!`);
 
-                // *** CRITICAL CHANGE: Request PCM 16000Hz ***
-                // We ask for Raw Audio (PCM), not Telephone Audio (MuLaw)
-                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=pcm_16000`;
+                // 1. Connect to ElevenLabs (Standard 8k Output)
+                // This restores the AI voice reliability.
+                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
                 });
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
-                    // Start the Mix Timer immediately (20ms)
+                    // 2. Start the 20ms Heartbeat IMMEDIATELY
                     if (!outputIntervalId) {
                         outputIntervalId = setInterval(streamAudioToTwilio, 20);
                     }
@@ -136,19 +129,16 @@ wss.on('connection', (ws) => {
                 
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
-                    
+                    // Standard Logic to grab chunks
                     let chunkData = null;
-                    // Handle various JSON structures
                     if (aiMsg.audio_event?.audio_base64_chunk) {
                         chunkData = aiMsg.audio_event.audio_base64_chunk;
                     } else if (aiMsg.audio_event?.audio) {
                          chunkData = aiMsg.audio_event.audio;
                     }
-
                     if (chunkData) {
-                        // This is now PCM 16000Hz (Raw Audio)
                         const newChunk = Buffer.from(chunkData, 'base64');
-                        aiPcmQueue = Buffer.concat([aiPcmQueue, newChunk]);
+                        audioQueue = Buffer.concat([audioQueue, newChunk]);
                     }
                 });
 
@@ -157,29 +147,35 @@ wss.on('connection', (ws) => {
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // *** INPUT: USER -> SCRIBE ***
-                    // 1. Decode Twilio MuLaw -> Linear
-                    // 2. Upsample 8k -> 16k
-                    // 3. Send to Scribe
+                    // *** INPUT: HD UPSAMPLING (8k -> 16k) ***
+                    // Keeps your voice clear for Scribe
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        const currentSample = muLawToLinearTable[twilioChunk[i]];
-                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        // Decode
+                        let sample = muLawToLinearTable[twilioChunk[i]];
                         
+                        // Boost
+                        sample = sample * MIC_BOOST;
+                        if (sample > 32767) sample = 32767;
+                        if (sample < -32768) sample = -32768;
+
+                        // Upsample (Linear Interpolation)
+                        const midPoint = Math.floor((lastInputSample + sample) / 2);
                         pcmChunk.writeInt16LE(midPoint, i * 4);
-                        pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
-                        lastInputSample = currentSample;
+                        pcmChunk.writeInt16LE(sample, i * 4 + 2);
+                        lastInputSample = sample;
                     }
 
-                    inputPcmQueue = Buffer.concat([inputPcmQueue, pcmChunk]);
+                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
                     
-                    if (inputPcmQueue.length >= 3200) { // 100ms buffer
+                    // Buffer 100ms for stability
+                    if (pcmInputQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({ 
-                            user_audio_chunk: inputPcmQueue.toString('base64') 
+                            user_audio_chunk: pcmInputQueue.toString('base64') 
                         }));
-                        inputPcmQueue = Buffer.alloc(0);
+                        pcmInputQueue = Buffer.alloc(0);
                     }
                 }
             } else if (msg.event === 'stop') {
@@ -193,64 +189,40 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
-    // --- THE MIXER (PCM 16k -> PCM 8k + BG -> MuLaw) ---
+    // --- THE UNBREAKABLE MIXER ---
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
-        // We need 160 samples (20ms @ 8000Hz)
-        const OUTPUT_SIZE = 160; 
-        const mixedBuffer = Buffer.alloc(OUTPUT_SIZE);
+        // We MUST send 160 bytes (20ms) every tick. No more, no less.
+        const CHUNK_SIZE = 160; 
+        const mixedBuffer = Buffer.alloc(CHUNK_SIZE);
         
         let hasBackground = (backgroundBuffer.length > 0);
         
-        // Calculate needed AI samples: 20ms @ 16000Hz = 320 samples (640 bytes)
-        const AI_NEEDED_BYTES = 640; 
+        // Grab AI Audio if available
         let aiChunk = null;
-
-        if (aiPcmQueue.length >= AI_NEEDED_BYTES) {
-            aiChunk = aiPcmQueue.subarray(0, AI_NEEDED_BYTES);
-            aiPcmQueue = aiPcmQueue.subarray(AI_NEEDED_BYTES);
+        if (audioQueue.length >= CHUNK_SIZE) {
+            aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
+            audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
-        for (let i = 0; i < OUTPUT_SIZE; i++) {
+        for (let i = 0; i < CHUNK_SIZE; i++) {
             let finalSample = 0;
 
-            // 1. MIX BACKGROUND (PCM 8000Hz)
+            // 1. Add Background
             if (hasBackground) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0;
+                // Read 16-bit PCM from file
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
                 finalSample += (bgSample * BG_VOLUME);
             }
 
-            // 2. MIX AI (Downsample 16k -> 8k)
+            // 2. Add AI Voice
             if (aiChunk) {
-                // To get 8k from 16k, we take every 2nd sample (Decimation)
-                // 16k Index: 0, 2, 4, 6...
-                const aiIndex = i * 4; // 2 bytes * 2 steps
-                const aiSample = aiChunk.readInt16LE(aiIndex);
-                
+                // Decode MuLaw AI -> Linear
+                const aiSample = muLawToLinearTable[aiChunk[i]];
                 finalSample += (aiSample * AI_VOLUME);
             }
 
-            // 3. CLAMP (Hard Limit)
-            if (finalSample > 32767) finalSample = 32767;
-            if (finalSample < -32768) finalSample = -32768;
-
-            // 4. ENCODE TO MULAW
-            let tableIndex = Math.floor(finalSample) + 32768;
-            if (tableIndex < 0) tableIndex = 0;
-            if (tableIndex > 65535) tableIndex = 65535;
-            
-            mixedBuffer[i] = linearToMuLawTable[tableIndex];
-        }
-
-        ws.send(JSON.stringify({
-            event: 'media',
-            streamSid: streamSid,
-            media: { payload: mixedBuffer.toString('base64') }
-        }));
-    }
-});
-
-server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
+            // 3. Clamp (Prevents Distortion)
