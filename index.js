@@ -1,10 +1,10 @@
 /**
- * Title: Split Reality AI Engine (Production Fix)
- * Description: Uses Express for stable routing and Buffers for clean audio mixing.
+ * Title: Split Reality Engine (Safe Mode)
+ * Description: Includes "Bad File Detector" to prevent loud static.
  */
 
 require('dotenv').config();
-const express = require('express'); // Added Express back to fix res.send error
+const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 const https = require('https');
@@ -12,21 +12,16 @@ const https = require('https');
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
-const AI_VOLUME = 1.0; 
-const BG_VOLUME = 0.02; // 2% volume for subtle ambience
+const AI_VOLUME = 1.0;          
+const BG_VOLUME = 0.05;         // 5% Volume (Safe Level)
+// ENSURE THIS IS THE *RAW* URL, NOT THE BLOB URL
 const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 const app = express();
-// Handle Twilio Form Data
 app.use(express.urlencoded({ extended: true }));
 
-// 1. Root Route (Health Check)
-app.get('/', (req, res) => {
-    res.send("Audio Server Online");
-});
+app.get('/', (req, res) => res.send("Audio Server Online"));
 
-// 2. Twilio Incoming Call Route (CRITICAL)
-// Without this, the call drops immediately because Twilio doesn't know what to do.
 app.post('/incoming-call', (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
@@ -40,86 +35,82 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ============================================================================
-// PART 1: G.711 MU-LAW DSP ENGINE (LUT)
-// ============================================================================
-class MuLawCoder {
-    constructor() {
-        this.mu2linear = new Int16Array(256);
-        this.linear2mu = new Uint8Array(65536);
-        this.generateTables();
-    }
+// --- DSP ENGINE (G.711) ---
+const muLawToLinearTable = new Int16Array(256);
+const linearToMuLawTable = new Uint8Array(65536);
 
-    generateTables() {
-        const BIAS = 0x84;
-        const CLIP = 32635;
-
-        // Decode Table (uLaw -> Linear)
-        for (let i = 0; i < 256; i++) {
-            let mu = ~i;
-            let sign = (mu & 0x80) >> 7;
-            let exponent = (mu & 0x70) >> 4;
-            let mantissa = mu & 0x0F;
-            let sample = ((mantissa << 3) + 0x84) << exponent;
-            sample -= 0x84;
-            if (sign) sample = -sample;
-            this.mu2linear[i] = sample;
-        }
-
-        // Encode Table (Linear -> uLaw)
-        const encodeSample = (sample) => {
-            sample = (sample < -CLIP) ? -CLIP : (sample > CLIP) ? CLIP : sample;
-            const sign = (sample < 0) ? 0x80 : 0;
-            sample = (sample < 0) ? -sample : sample;
-            sample += BIAS;
-            let exponent = 7;
-            for (let exp = 0; exp < 8; exp++) {
-                if (sample < (1 << (exp + 5))) {
-                    exponent = exp;
-                    break;
-                }
-            }
-            const mantissa = (sample >> (exponent + 3)) & 0x0F;
-            return ~(sign | (exponent << 4) | mantissa) & 0xFF;
-        };
-
-        for (let i = -32768; i <= 32767; i++) {
-            this.linear2mu[i + 32768] = encodeSample(i);
-        }
-    }
-
-    decode(muByte) {
-        return this.mu2linear[muByte];
-    }
-
-    encode(linearSample) {
-        return this.linear2mu[linearSample + 32768];
-    }
+// Generate Decode Table
+for (let i = 0; i < 256; i++) {
+    let mu = ~i;
+    let sign = (mu & 0x80) >> 7;
+    let exponent = (mu & 0x70) >> 4;
+    let mantissa = mu & 0x0F;
+    let sample = ((mantissa << 3) + 0x84) << exponent;
+    muLawToLinearTable[i] = sign === 0 ? -(sample - 0x84) : (sample - 0x84);
 }
 
-const g711 = new MuLawCoder();
+// Generate Encode Table
+const linearToMuLaw = (sample) => {
+    const BIAS = 0x84;
+    const CLIP = 32635;
+    sample = (sample < -CLIP) ? -CLIP : (sample > CLIP) ? CLIP : sample;
+    const sign = (sample < 0) ? 0x80 : 0;
+    sample = (sample < 0) ? -sample : sample;
+    sample += BIAS;
+    let exponent = 7;
+    for (let exp = 0; exp < 8; exp++) {
+        if (sample < (1 << (exp + 5))) {
+            exponent = exp;
+            break;
+        }
+    }
+    const mantissa = (sample >> (exponent + 3)) & 0x0F;
+    return ~(sign | (exponent << 4) | mantissa) & 0xFF;
+};
 
-// ============================================================================
-// PART 2: BACKGROUND LOADER
-// ============================================================================
+for (let i = -32768; i <= 32767; i++) {
+    linearToMuLawTable[i + 32768] = linearToMuLaw(i);
+}
+
+// --- SAFE BACKGROUND LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
+let isBackgroundValid = false;
 
-console.log(`[SYSTEM] Downloading Background Raw Audio...`);
+console.log(`[SYSTEM] Downloading Background...`);
 https.get(BG_URL, (res) => {
+    if (res.statusCode !== 200) {
+        console.error(`[ERROR] Could not download file. Status: ${res.statusCode}`);
+        return;
+    }
     const data = [];
     res.on('data', chunk => data.push(chunk));
     res.on('end', () => {
-        backgroundBuffer = Buffer.concat(data);
-        console.log(`[SYSTEM] Background Loaded! ${backgroundBuffer.length} bytes.`);
+        const fullBuffer = Buffer.concat(data);
+        
+        // --- SECURITY CHECK: IS THIS HTML? ---
+        const startString = fullBuffer.subarray(0, 50).toString('utf-8');
+        if (startString.includes("<!DOCTYPE") || startString.includes("<html")) {
+            console.error("___________________________________________________");
+            console.error("[CRITICAL ERROR] The Background URL is pointing to a WEBPAGE, not a RAW file.");
+            console.error("[ACTION] Background audio has been DISABLED to prevent loud static.");
+            console.error("___________________________________________________");
+            isBackgroundValid = false;
+        } else if (startString.startsWith("RIFF")) {
+             console.warn("[WARN] Detected WAV Header. Playing anyway (might hear one click at start).");
+             backgroundBuffer = fullBuffer.subarray(44); // Strip header just in case
+             isBackgroundValid = true;
+        } else {
+            console.log(`[SYSTEM] Background Audio Verified! (${fullBuffer.length} bytes)`);
+            backgroundBuffer = fullBuffer;
+            isBackgroundValid = true;
+        }
     });
-}).on('error', err => console.error("[ERROR] Failed to download background:", err.message));
+}).on('error', err => console.error("[ERROR] Network error:", err.message));
 
 
-// ============================================================================
-// PART 3: WEBSOCKET MIXER
-// ============================================================================
+// --- MIXER ---
 wss.on('connection', (ws) => {
-    console.log('[TWILIO] Stream Connected');
+    console.log('[TWILIO] Call Connected');
     
     let elevenLabsWs = null;
     let streamSid = null;
@@ -133,15 +124,11 @@ wss.on('connection', (ws) => {
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log(`[TWILIO] Stream Started: ${streamSid}`);
-
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
-                elevenLabsWs = new WebSocket(url, {
-                    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
-                });
+                elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
 
                 elevenLabsWs.on('open', () => {
-                    console.log("[11LABS] Connected");
+                    console.log("[11LABS] AI Connected");
                     if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
                 });
                 
@@ -152,76 +139,59 @@ wss.on('connection', (ws) => {
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
                     }
                 });
-
-                elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
-                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
-
             } else if (msg.event === 'media') {
-                // --- INPUT: Caller -> AI (Clean) ---
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // Convert uLaw to Linear PCM for 11Labs
+                    // Simple conversion for 11Labs Input
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
-                        const linearSample = g711.decode(twilioData[i]);
-                        pcmData.writeInt16LE(linearSample, i * 2);
+                        pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
                     }
-                    elevenLabsWs.send(JSON.stringify({ 
-                        user_audio_chunk: pcmData.toString('base64') 
-                    }));
+                    elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcmData.toString('base64') }));
                 }
             } else if (msg.event === 'stop') {
-                console.log(`[TWILIO] Stream Stopped`);
                 if (elevenLabsWs) elevenLabsWs.close();
                 clearInterval(mixerInterval);
             }
-        } catch (e) {
-            console.error(e);
-        }
+        } catch (e) { console.error(e); }
     });
 
-    ws.on('close', () => {
-        clearInterval(mixerInterval);
-        console.log('[TWILIO] Client Disconnected');
-    });
+    ws.on('close', () => clearInterval(mixerInterval));
 
-    // --- MIXER LOOP ---
     function mixAndStream() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
-        const SAMPLES_PER_CHUNK = 160; 
-        const mixedBuffer = Buffer.alloc(SAMPLES_PER_CHUNK); 
+        const CHUNK_SIZE = 160; 
+        const mixedBuffer = Buffer.alloc(CHUNK_SIZE); 
 
-        // Get AI Audio
+        // AI Chunk
         let aiChunk = null;
-        if (audioQueue.length >= SAMPLES_PER_CHUNK) {
-            aiChunk = audioQueue.subarray(0, SAMPLES_PER_CHUNK);
-            audioQueue = audioQueue.subarray(SAMPLES_PER_CHUNK);
+        if (audioQueue.length >= CHUNK_SIZE) {
+            aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
+            audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
-        for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
+        for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Background Layer
-            if (backgroundBuffer.length > 0) {
+            // 1. Add Background (ONLY IF VALID)
+            if (isBackgroundValid && backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
                 sampleSum += (bgSample * BG_VOLUME);
             }
 
-            // 2. AI Layer
+            // 2. Add AI
             if (aiChunk) {
-                const aiSample = g711.decode(aiChunk[i]);
-                sampleSum += (aiSample * AI_VOLUME);
+                sampleSum += muLawToLinearTable[aiChunk[i]] * AI_VOLUME;
             }
 
-            // 3. Hard Clip
+            // 3. Clip
             if (sampleSum > 32767) sampleSum = 32767;
             if (sampleSum < -32768) sampleSum = -32768;
 
-            // 4. Encode Output
-            mixedBuffer[i] = g711.encode(Math.floor(sampleSum));
+            mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
         }
 
         ws.send(JSON.stringify({
@@ -232,6 +202,4 @@ wss.on('connection', (ws) => {
     }
 });
 
-server.listen(PORT, () => {
-    console.log(`[SYSTEM] Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`[SYSTEM] Listening on ${PORT}`));
