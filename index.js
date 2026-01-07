@@ -1,6 +1,6 @@
 /**
- * Title: Split Reality Engine (Paranoia Mode)
- * Description: Forces low volume and logs AI activity.
+ * Title: Split Reality Diagnostic Engine
+ * Description: Mutes audio to test AI, logs data to find distortion source.
  */
 
 require('dotenv').config();
@@ -12,16 +12,14 @@ const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 
-// --- CONFIGURATION ---
+// --- DIAGNOSTIC SETTINGS ---
 const AI_VOLUME = 1.0; 
-// PARANOIA SETTING: Force background to 1% volume. 
-// This guarantees it cannot be "super loud" unless the server is broken.
-const BG_VOLUME = 0.01; 
+const BG_VOLUME = 0.0; // MUTED: We want to hear if the AI works alone.
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Audio Server Online"));
+app.get('/', (req, res) => res.send("Diagnostic Server Online"));
 
 app.post('/incoming-call', (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -36,11 +34,10 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- DSP ENGINE (G.711) ---
+// --- G.711 LUTs ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
-// Decode Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -50,7 +47,6 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -(sample - 0x84) : (sample - 0x84);
 }
 
-// Encode Table
 const linearToMuLaw = (sample) => {
     const BIAS = 0x84;
     const CLIP = 32635;
@@ -73,30 +69,30 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- LOCAL FILE LOADER ---
+// --- FILE LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 try {
     const filePath = path.join(__dirname, 'background.raw');
     if (fs.existsSync(filePath)) {
         backgroundBuffer = fs.readFileSync(filePath);
-        console.log(`[SYSTEM] Loaded background.raw (${backgroundBuffer.length} bytes)`);
+        console.log(`[SYSTEM] Loaded background.raw: ${backgroundBuffer.length} bytes`);
     } else {
         console.error(`[WARN] File not found: ${filePath}`);
     }
 } catch (err) {
-    console.error(`[ERROR] File Load Failed: ${err.message}`);
+    console.error(`[ERROR] Load Failed: ${err.message}`);
 }
 
 // --- MIXER ---
 wss.on('connection', (ws) => {
-    console.log('[TWILIO] Stream Connected');
+    console.log('[TWILIO] Connection Accepted');
     
     let elevenLabsWs = null;
     let streamSid = null;
     let audioQueue = Buffer.alloc(0);
     let bgIndex = 0;
     let mixerInterval = null;
-    let hasAiSpoken = false; // Debug flag
+    let logCounter = 0; // Limit logs so we don't crash
 
     ws.on('message', (message) => {
         try {
@@ -104,13 +100,12 @@ wss.on('connection', (ws) => {
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                // Connect to ElevenLabs (Output: u-law 8000Hz)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
-                    if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
+                    mixerInterval = setInterval(mixAndStream, 20);
                 });
                 
                 elevenLabsWs.on('message', (data) => {
@@ -118,22 +113,18 @@ wss.on('connection', (ws) => {
                     if (aiMsg.audio_event?.audio_base64_chunk) {
                         const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
-                        
-                        if (!hasAiSpoken) {
-                            console.log("[11LABS] AI is sending audio! (Speech detected)");
-                            hasAiSpoken = true;
-                        }
                     }
                 });
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // TRANSLATOR: Convert Twilio uLaw to Linear PCM for AI Input
+                    // INPUT DEBUG: Are we receiving audio?
+                    if (logCounter < 5) console.log(`[INPUT] Received ${twilioData.length} bytes from Twilio`);
+                    
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
                         pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
                     }
-                    // Send pure voice to AI
                     elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcmData.toString('base64') }));
                 }
             } else if (msg.event === 'stop') {
@@ -157,31 +148,46 @@ wss.on('connection', (ws) => {
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
+        // --- DIAGNOSTIC LOGGING ---
+        // We log the very first sample of every 50th frame to see what's happening
+        let debugBgSample = 0;
+        let debugAiSample = 0;
+
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background (FORCED LOW VOLUME)
+            // 1. Read Background (Even if volume is 0, we read it to check values)
+            let bgSample = 0;
             if (backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
-                const bgSample = backgroundBuffer.readInt16LE(bgIndex);
+                bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                
-                // FORCE 1% VOLUME
-                // This will sound very faint. If you hear loud static, 
-                // the issue is not math, it's the file type.
-                sampleSum += (bgSample * BG_VOLUME); 
+                debugBgSample = bgSample; // Capture for log
             }
 
-            // 2. Add AI Voice
+            // 2. Read AI
+            let aiSample = 0;
             if (aiChunk) {
-                sampleSum += muLawToLinearTable[aiChunk[i]] * AI_VOLUME;
+                aiSample = muLawToLinearTable[aiChunk[i]];
+                debugAiSample = aiSample; // Capture for log
             }
 
-            // 3. Hard Limit
-            if (sampleSum > 30000) sampleSum = 30000;
-            if (sampleSum < -30000) sampleSum = -30000;
+            // 3. MIX (With Mute applied)
+            sampleSum += (bgSample * BG_VOLUME); // This is 0.0 right now
+            sampleSum += (aiSample * AI_VOLUME);
+
+            // 4. Clip
+            if (sampleSum > 32700) sampleSum = 32700;
+            if (sampleSum < -32700) sampleSum = -32700;
 
             mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
+        }
+
+        // --- PRINT THE DATA (Once per second approx) ---
+        logCounter++;
+        if (logCounter % 50 === 0) {
+             console.log(`[DIAGNOSTIC] BG Raw Value: ${debugBgSample} | AI Raw Value: ${debugAiSample}`);
+             if (Math.abs(debugBgSample) > 10000) console.warn(">>> WARNING: Background file is VERY LOUD! <<<");
         }
 
         ws.send(JSON.stringify({
@@ -192,4 +198,4 @@ wss.on('connection', (ws) => {
     }
 });
 
-server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
+server.listen(PORT, () => console.log(`[SYSTEM] Diagnostic Server on ${PORT}`));
