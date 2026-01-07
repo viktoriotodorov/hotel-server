@@ -1,6 +1,9 @@
 /**
- * Title: Split Reality Hybrid Engine
- * Description: Merges your working Input Logic (Upsampling) with clean Background Mixing.
+ * Title: Split Reality Balanced Engine
+ * Description: 
+ * 1. AI INPUT: Upsampled (8k->16k) + Boosted (5x) so AI understands you.
+ * 2. AI OUTPUT: Boosted (3x) so you can actually hear the AI.
+ * 3. BACKGROUND: Forced to 2% volume so it doesn't drown out the AI.
  */
 
 require('dotenv').config();
@@ -12,14 +15,15 @@ const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 
-// --- CONFIGURATION ---
-const AI_VOLUME = 1.0;  // 100% (No Boost of 5.0, prevents distortion)
-const BG_VOLUME = 1.0;  // 100% (Since your file is already quieted to 5%)
+// --- CRITICAL VOLUME SETTINGS ---
+const AI_INPUT_BOOST = 5.0;  // Mic Boost: Helps AI hear you
+const AI_OUTPUT_BOOST = 3.0; // Speaker Boost: Helps you hear AI
+const BG_VOLUME = 0.02;      // Background: Locked to 2% (Safe Mode)
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Hybrid Audio Server Online"));
+app.get('/', (req, res) => res.send("Balanced Audio Server Online"));
 
 app.post('/incoming-call', (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -34,11 +38,11 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- DSP ENGINE (G.711 LUT) ---
+// --- DSP ENGINE (Standard G.711) ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
-// Generate Decode Table
+// Decode Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -48,7 +52,7 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -(sample - 0x84) : (sample - 0x84);
 }
 
-// Generate Encode Table
+// Encode Table
 const linearToMuLaw = (sample) => {
     const BIAS = 0x84;
     const CLIP = 32635;
@@ -74,12 +78,12 @@ for (let i = -32768; i <= 32767; i++) {
 // --- LOCAL FILE LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 try {
-    const filePath = path.join(__dirname, 'background.raw');
+    const filePath = path.join(__dirname, 'backgroundn.raw');
     if (fs.existsSync(filePath)) {
         backgroundBuffer = fs.readFileSync(filePath);
         console.log(`[SYSTEM] Background Loaded: ${backgroundBuffer.length} bytes`);
     } else {
-        console.warn(`[WARN] background.raw not found. Please upload it.`);
+        console.warn(`[WARN] backgroundn.raw not found.`);
     }
 } catch (err) {
     console.error(`[ERROR] File Load Failed: ${err.message}`);
@@ -95,7 +99,7 @@ wss.on('connection', (ws) => {
     let bgIndex = 0;
     let mixerInterval = null;
     
-    // VARIABLES FOR YOUR UPSAMPLING LOGIC
+    // INPUT VARIABLES
     let pcmInputQueue = Buffer.alloc(0);
     let lastInputSample = 0;
 
@@ -115,25 +119,33 @@ wss.on('connection', (ws) => {
                 
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
-                    if (aiMsg.audio_event?.audio_base64_chunk) {
-                        const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
+                    // ROBUST PARSING (From your old code)
+                    let chunkData = null;
+                    if (aiMsg.audio_event) {
+                        if (aiMsg.audio_event.audio_base64_chunk) chunkData = aiMsg.audio_event.audio_base64_chunk;
+                        else if (aiMsg.audio_event.audio) chunkData = aiMsg.audio_event.audio;
+                    }
+
+                    if (chunkData) {
+                        const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
                     }
                 });
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // --- YOUR ORIGINAL INPUT LOGIC (UPSAMPLING 8k -> 16k) ---
+                    // --- INPUT LOGIC: UPSAMPLE + BOOST (AI HEARING FIX) ---
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
-                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); // 2 bytes * 2 (doubling samples)
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
-                        const currentSample = muLawToLinearTable[twilioChunk[i]];
-                        // Create a mid-point sample (Linear Interpolation)
-                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        let currentSample = muLawToLinearTable[twilioChunk[i]];
                         
-                        // Write Mid-point (Upsample)
+                        // 1. MIC BOOST (500%)
+                        currentSample = currentSample * AI_INPUT_BOOST; 
+                        
+                        // 2. UPSAMPLE (8k -> 16k)
+                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
                         pcmChunk.writeInt16LE(midPoint, i * 4);
-                        // Write Actual Sample
                         pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
                         
                         lastInputSample = currentSample;
@@ -141,8 +153,7 @@ wss.on('connection', (ws) => {
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
 
-                    // Send when we have enough data
-                    if (pcmInputQueue.length >= 1600) {
+                    if (pcmInputQueue.length >= 3200) { 
                         elevenLabsWs.send(JSON.stringify({ 
                             user_audio_chunk: pcmInputQueue.toString('base64') 
                         }));
@@ -173,20 +184,20 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background
+            // 1. Add Background (Safety Mode: 2%)
             if (backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                
-                // Use 1.0 because your file is quiet. Use 0.05 if using original file.
-                sampleSum += (bgSample * BG_VOLUME);
+                sampleSum += (bgSample * BG_VOLUME); 
             }
 
-            // 2. Add AI Voice (NO BOOST)
+            // 2. Add AI Voice (SPEAKER BOOST: 300%)
+            // This ensures you can hear the AI over the phone line.
             if (aiChunk) {
-                const aiSample = muLawToLinearTable[aiChunk[i]];
-                sampleSum += (aiSample * AI_VOLUME);
+                let aiSample = muLawToLinearTable[aiChunk[i]];
+                aiSample = aiSample * AI_OUTPUT_BOOST; 
+                sampleSum += aiSample;
             }
 
             // 3. Hard Clip
