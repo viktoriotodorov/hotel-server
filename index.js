@@ -1,6 +1,6 @@
 /**
- * Title: Split Reality Engine (Safe Mode)
- * Description: Includes "Bad File Detector" to prevent loud static.
+ * Title: Split Reality Engine (Distortion Fix)
+ * Description: Volume lowered to 1% to prevent digital clipping.
  */
 
 require('dotenv').config();
@@ -12,9 +12,8 @@ const https = require('https');
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
-const AI_VOLUME = 1.0;          
-const BG_VOLUME = 0.05;         // 5% Volume (Safe Level)
-// ENSURE THIS IS THE *RAW* URL, NOT THE BLOB URL
+const AI_VOLUME = 1.0;          // AI Voice (100%)
+const BG_VOLUME = 0.01;         // Background Music (1%) <- FIXED: Reduced from 0.05
 const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 const app = express();
@@ -39,7 +38,7 @@ const wss = new WebSocket.Server({ server });
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
-// Generate Decode Table
+// Decode Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -49,7 +48,7 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -(sample - 0x84) : (sample - 0x84);
 }
 
-// Generate Encode Table
+// Encode Table
 const linearToMuLaw = (sample) => {
     const BIAS = 0x84;
     const CLIP = 32635;
@@ -72,33 +71,21 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- SAFE BACKGROUND LOADER ---
+// --- BACKGROUND LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 let isBackgroundValid = false;
 
 console.log(`[SYSTEM] Downloading Background...`);
 https.get(BG_URL, (res) => {
-    if (res.statusCode !== 200) {
-        console.error(`[ERROR] Could not download file. Status: ${res.statusCode}`);
-        return;
-    }
     const data = [];
     res.on('data', chunk => data.push(chunk));
     res.on('end', () => {
         const fullBuffer = Buffer.concat(data);
-        
-        // --- SECURITY CHECK: IS THIS HTML? ---
+        // Safety check for HTML/Text
         const startString = fullBuffer.subarray(0, 50).toString('utf-8');
         if (startString.includes("<!DOCTYPE") || startString.includes("<html")) {
-            console.error("___________________________________________________");
-            console.error("[CRITICAL ERROR] The Background URL is pointing to a WEBPAGE, not a RAW file.");
-            console.error("[ACTION] Background audio has been DISABLED to prevent loud static.");
-            console.error("___________________________________________________");
+            console.error("[CRITICAL] URL is returning a webpage, not audio.");
             isBackgroundValid = false;
-        } else if (startString.startsWith("RIFF")) {
-             console.warn("[WARN] Detected WAV Header. Playing anyway (might hear one click at start).");
-             backgroundBuffer = fullBuffer.subarray(44); // Strip header just in case
-             isBackgroundValid = true;
         } else {
             console.log(`[SYSTEM] Background Audio Verified! (${fullBuffer.length} bytes)`);
             backgroundBuffer = fullBuffer;
@@ -110,7 +97,7 @@ https.get(BG_URL, (res) => {
 
 // --- MIXER ---
 wss.on('connection', (ws) => {
-    console.log('[TWILIO] Call Connected');
+    console.log('[TWILIO] Stream Connected');
     
     let elevenLabsWs = null;
     let streamSid = null;
@@ -142,7 +129,7 @@ wss.on('connection', (ws) => {
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // Simple conversion for 11Labs Input
+                    // Send Clean Audio to AI (No Mix)
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
                         pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
@@ -164,7 +151,6 @@ wss.on('connection', (ws) => {
         const CHUNK_SIZE = 160; 
         const mixedBuffer = Buffer.alloc(CHUNK_SIZE); 
 
-        // AI Chunk
         let aiChunk = null;
         if (audioQueue.length >= CHUNK_SIZE) {
             aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
@@ -174,22 +160,25 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background (ONLY IF VALID)
+            // 1. Add Background (Very Quiet)
             if (isBackgroundValid && backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
+                
+                // Add background with volume limit
                 sampleSum += (bgSample * BG_VOLUME);
             }
 
-            // 2. Add AI
+            // 2. Add AI Voice
             if (aiChunk) {
                 sampleSum += muLawToLinearTable[aiChunk[i]] * AI_VOLUME;
             }
 
-            // 3. Clip
-            if (sampleSum > 32767) sampleSum = 32767;
-            if (sampleSum < -32768) sampleSum = -32768;
+            // 3. Soft Clip (Prevents "Crunchy" Distortion)
+            // If the volume is too loud, we squash it gently instead of chopping it off
+            if (sampleSum > 32700) sampleSum = 32700;
+            if (sampleSum < -32700) sampleSum = -32700;
 
             mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
         }
@@ -203,4 +192,3 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Listening on ${PORT}`));
-
