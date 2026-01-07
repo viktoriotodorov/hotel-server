@@ -1,30 +1,52 @@
 /**
- * Title: Split Reality AI Engine (High-Fidelity)
- * Description: Connects Caller to ElevenLabs AI while mixing background audio.
- * Architecture: Packet-Clocked (Drift elimination)
- * DSP: Lookup Table based G.711 transcoding
+ * Title: Split Reality AI Engine (Production Fix)
+ * Description: Uses Express for stable routing and Buffers for clean audio mixing.
  */
 
+require('dotenv').config();
+const express = require('express'); // Added Express back to fix res.send error
 const WebSocket = require('ws');
 const http = require('http');
-const https = require('https'); // Added for downloading raw file
-require('dotenv').config();
+const https = require('https');
 
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
 const AI_VOLUME = 1.0; 
-const BG_VOLUME = 0.02; // Keep this low (2%) for a subtle effect
-// Use your RAW file URL here
+const BG_VOLUME = 0.02; // 2% volume for subtle ambience
 const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
+const app = express();
+// Handle Twilio Form Data
+app.use(express.urlencoded({ extended: true }));
+
+// 1. Root Route (Health Check)
+app.get('/', (req, res) => {
+    res.send("Audio Server Online");
+});
+
+// 2. Twilio Incoming Call Route (CRITICAL)
+// Without this, the call drops immediately because Twilio doesn't know what to do.
+app.post('/incoming-call', (req, res) => {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Connect>
+          <Stream url="wss://${req.headers.host}/media-stream" />
+        </Connect>
+      </Response>`;
+    res.type('text/xml').send(twiml);
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 // ============================================================================
-// PART 1: G.711 MU-LAW DSP ENGINE (Corrected)
+// PART 1: G.711 MU-LAW DSP ENGINE (LUT)
 // ============================================================================
 class MuLawCoder {
     constructor() {
         this.mu2linear = new Int16Array(256);
-        this.linear2mu = new Uint8Array(65536); // Covers full 16-bit range for safety
+        this.linear2mu = new Uint8Array(65536);
         this.generateTables();
     }
 
@@ -32,7 +54,7 @@ class MuLawCoder {
         const BIAS = 0x84;
         const CLIP = 32635;
 
-        // 1. Generate mu-law to Linear (Expansion)
+        // Decode Table (uLaw -> Linear)
         for (let i = 0; i < 256; i++) {
             let mu = ~i;
             let sign = (mu & 0x80) >> 7;
@@ -44,8 +66,7 @@ class MuLawCoder {
             this.mu2linear[i] = sample;
         }
 
-        // 2. Generate Linear to mu-law (Compression)
-        // Helper function for single sample
+        // Encode Table (Linear -> uLaw)
         const encodeSample = (sample) => {
             sample = (sample < -CLIP) ? -CLIP : (sample > CLIP) ? CLIP : sample;
             const sign = (sample < 0) ? 0x80 : 0;
@@ -62,13 +83,11 @@ class MuLawCoder {
             return ~(sign | (exponent << 4) | mantissa) & 0xFF;
         };
 
-        // Fill LUT (Offset by 32768 to handle negative array indices)
         for (let i = -32768; i <= 32767; i++) {
             this.linear2mu[i + 32768] = encodeSample(i);
         }
     }
 
-    // FIX: Now returns the value, not the array
     decode(muByte) {
         return this.mu2linear[muByte];
     }
@@ -81,7 +100,7 @@ class MuLawCoder {
 const g711 = new MuLawCoder();
 
 // ============================================================================
-// PART 2: BACKGROUND LOADER (Network Driven)
+// PART 2: BACKGROUND LOADER
 // ============================================================================
 let backgroundBuffer = Buffer.alloc(0);
 
@@ -97,17 +116,14 @@ https.get(BG_URL, (res) => {
 
 
 // ============================================================================
-// PART 3: SERVER & MIXER
+// PART 3: WEBSOCKET MIXER
 // ============================================================================
-const server = http.createServer((req, res) => res.send("Audio Server Online"));
-const wss = new WebSocket.Server({ server });
-
 wss.on('connection', (ws) => {
     console.log('[TWILIO] Stream Connected');
     
     let elevenLabsWs = null;
     let streamSid = null;
-    let audioQueue = Buffer.alloc(0); // Queue for AI Audio
+    let audioQueue = Buffer.alloc(0);
     let bgIndex = 0;
     let mixerInterval = null;
 
@@ -119,7 +135,6 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream Started: ${streamSid}`);
 
-                // Connect to ElevenLabs
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -127,7 +142,6 @@ wss.on('connection', (ws) => {
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
-                    // Start Mixer immediately
                     if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
                 });
                 
@@ -143,18 +157,15 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
-                // --- INPUT LOGIC: Caller -> AI (Clean) ---
+                // --- INPUT: Caller -> AI (Clean) ---
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // 1. Decode Twilio u-law to Linear
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
+                    // Convert uLaw to Linear PCM for 11Labs
                     const pcmData = Buffer.alloc(twilioData.length * 2);
-
                     for (let i = 0; i < twilioData.length; i++) {
                         const linearSample = g711.decode(twilioData[i]);
                         pcmData.writeInt16LE(linearSample, i * 2);
                     }
-
-                    // 2. Send Linear PCM to ElevenLabs
                     elevenLabsWs.send(JSON.stringify({ 
                         user_audio_chunk: pcmData.toString('base64') 
                     }));
@@ -174,15 +185,14 @@ wss.on('connection', (ws) => {
         console.log('[TWILIO] Client Disconnected');
     });
 
-    // --- THE MIXER LOOP ---
-    // Mixes AI Audio + Background -> Twilio
+    // --- MIXER LOOP ---
     function mixAndStream() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
         const SAMPLES_PER_CHUNK = 160; 
         const mixedBuffer = Buffer.alloc(SAMPLES_PER_CHUNK); 
 
-        // 1. Get AI Audio Chunk (if available)
+        // Get AI Audio
         let aiChunk = null;
         if (audioQueue.length >= SAMPLES_PER_CHUNK) {
             aiChunk = audioQueue.subarray(0, SAMPLES_PER_CHUNK);
@@ -192,7 +202,7 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
             let sampleSum = 0;
 
-            // A. Add Background
+            // 1. Background Layer
             if (backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
@@ -200,17 +210,17 @@ wss.on('connection', (ws) => {
                 sampleSum += (bgSample * BG_VOLUME);
             }
 
-            // B. Add AI Voice
+            // 2. AI Layer
             if (aiChunk) {
-                const aiSample = g711.decode(aiChunk[i]); // Decode u-law AI
+                const aiSample = g711.decode(aiChunk[i]);
                 sampleSum += (aiSample * AI_VOLUME);
             }
 
-            // C. Hard Clip
+            // 3. Hard Clip
             if (sampleSum > 32767) sampleSum = 32767;
             if (sampleSum < -32768) sampleSum = -32768;
 
-            // D. Encode to u-law
+            // 4. Encode Output
             mixedBuffer[i] = g711.encode(Math.floor(sampleSum));
         }
 
@@ -223,5 +233,5 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => {
-    console.log(`[SYSTEM] Listening on port ${PORT}`);
+    console.log(`[SYSTEM] Server listening on port ${PORT}`);
 });
