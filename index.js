@@ -1,20 +1,22 @@
 /**
- * Title: Split Reality Engine (Local File Edition)
- * Description: Loads audio from disk for maximum stability.
+ * Title: Split Reality Engine (Paranoia Mode)
+ * Description: Forces low volume and logs AI activity.
  */
 
 require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');       // Added File System module
-const path = require('path');   // Added Path module
+const fs = require('fs');
+const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
-const AI_VOLUME = 1.0;
-const BG_VOLUME = 1.0; // File is already pre-quieted to 5% via ffmpeg
+const AI_VOLUME = 1.0; 
+// PARANOIA SETTING: Force background to 1% volume. 
+// This guarantees it cannot be "super loud" unless the server is broken.
+const BG_VOLUME = 0.01; 
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -34,7 +36,7 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- DSP ENGINE (G.711 LUT) ---
+// --- DSP ENGINE (G.711) ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
@@ -71,28 +73,18 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- LOCAL FILE LOADER (The Fix) ---
+// --- LOCAL FILE LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
-let isBackgroundValid = false;
-
-// We load the file immediately when the server starts
 try {
     const filePath = path.join(__dirname, 'background.raw');
-    
-    // Check if file exists
     if (fs.existsSync(filePath)) {
-        console.log(`[SYSTEM] Loading background audio from disk: ${filePath}`);
         backgroundBuffer = fs.readFileSync(filePath);
-        console.log(`[SYSTEM] Background Loaded! Size: ${backgroundBuffer.length} bytes.`);
-        isBackgroundValid = true;
+        console.log(`[SYSTEM] Loaded background.raw (${backgroundBuffer.length} bytes)`);
     } else {
-        console.error(`[CRITICAL] background.raw not found at ${filePath}`);
-        console.error(`[ACTION] Make sure you uploaded background.raw to your GitHub repo!`);
-        isBackgroundValid = false;
+        console.error(`[WARN] File not found: ${filePath}`);
     }
 } catch (err) {
-    console.error(`[ERROR] Failed to load background file: ${err.message}`);
-    isBackgroundValid = false;
+    console.error(`[ERROR] File Load Failed: ${err.message}`);
 }
 
 // --- MIXER ---
@@ -104,6 +96,7 @@ wss.on('connection', (ws) => {
     let audioQueue = Buffer.alloc(0);
     let bgIndex = 0;
     let mixerInterval = null;
+    let hasAiSpoken = false; // Debug flag
 
     ws.on('message', (message) => {
         try {
@@ -111,6 +104,7 @@ wss.on('connection', (ws) => {
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
+                // Connect to ElevenLabs (Output: u-law 8000Hz)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
 
@@ -124,16 +118,22 @@ wss.on('connection', (ws) => {
                     if (aiMsg.audio_event?.audio_base64_chunk) {
                         const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
+                        
+                        if (!hasAiSpoken) {
+                            console.log("[11LABS] AI is sending audio! (Speech detected)");
+                            hasAiSpoken = true;
+                        }
                     }
                 });
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // Send Clean Audio to AI (No Mix)
+                    // TRANSLATOR: Convert Twilio uLaw to Linear PCM for AI Input
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
                         pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
                     }
+                    // Send pure voice to AI
                     elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcmData.toString('base64') }));
                 }
             } else if (msg.event === 'stop') {
@@ -160,12 +160,16 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background
-            if (isBackgroundValid && backgroundBuffer.length > 0) {
+            // 1. Add Background (FORCED LOW VOLUME)
+            if (backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                sampleSum += (bgSample * BG_VOLUME);
+                
+                // FORCE 1% VOLUME
+                // This will sound very faint. If you hear loud static, 
+                // the issue is not math, it's the file type.
+                sampleSum += (bgSample * BG_VOLUME); 
             }
 
             // 2. Add AI Voice
@@ -173,9 +177,9 @@ wss.on('connection', (ws) => {
                 sampleSum += muLawToLinearTable[aiChunk[i]] * AI_VOLUME;
             }
 
-            // 3. Soft Clip
-            if (sampleSum > 32700) sampleSum = 32700;
-            if (sampleSum < -32700) sampleSum = -32700;
+            // 3. Hard Limit
+            if (sampleSum > 30000) sampleSum = 30000;
+            if (sampleSum < -30000) sampleSum = -30000;
 
             mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
         }
