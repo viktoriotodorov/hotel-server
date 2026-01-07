@@ -1,17 +1,18 @@
 {
-  "name": "twilio-split-reality-stream",
+  "name": "twilio-media-stream-mixer",
   "version": "1.0.0",
-  "description": "Twilio Media Stream with Background Mixing and AI Split Reality",
+  "description": "High-fidelity packet-clocked audio mixer for Twilio Media Streams",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "ws": "^8.13.0"
+    "ws": "^8.16.0",
+    "dotenv": "^16.3.1"
   },
   "engines": {
     "node": ">=16.0.0"
-  }
+  },
+  "author": "DSP Systems Architect",
+  "license": "MIT"
 }
