@@ -1,6 +1,6 @@
 /**
- * Title: Split Reality Diagnostic Engine
- * Description: Mutes audio to test AI, logs data to find distortion source.
+ * Title: Split Reality Hybrid Engine
+ * Description: Merges your working Input Logic (Upsampling) with clean Background Mixing.
  */
 
 require('dotenv').config();
@@ -12,14 +12,14 @@ const path = require('path');
 
 const PORT = process.env.PORT || 8080;
 
-// --- DIAGNOSTIC SETTINGS ---
-const AI_VOLUME = 1.0; 
-const BG_VOLUME = 0.0; // MUTED: We want to hear if the AI works alone.
+// --- CONFIGURATION ---
+const AI_VOLUME = 1.0;  // 100% (No Boost of 5.0, prevents distortion)
+const BG_VOLUME = 1.0;  // 100% (Since your file is already quieted to 5%)
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => res.send("Diagnostic Server Online"));
+app.get('/', (req, res) => res.send("Hybrid Audio Server Online"));
 
 app.post('/incoming-call', (req, res) => {
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -34,10 +34,11 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- G.711 LUTs ---
+// --- DSP ENGINE (G.711 LUT) ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
+// Generate Decode Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -47,6 +48,7 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -(sample - 0x84) : (sample - 0x84);
 }
 
+// Generate Encode Table
 const linearToMuLaw = (sample) => {
     const BIAS = 0x84;
     const CLIP = 32635;
@@ -69,30 +71,33 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- FILE LOADER ---
+// --- LOCAL FILE LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 try {
     const filePath = path.join(__dirname, 'background.raw');
     if (fs.existsSync(filePath)) {
         backgroundBuffer = fs.readFileSync(filePath);
-        console.log(`[SYSTEM] Loaded background.raw: ${backgroundBuffer.length} bytes`);
+        console.log(`[SYSTEM] Background Loaded: ${backgroundBuffer.length} bytes`);
     } else {
-        console.error(`[WARN] File not found: ${filePath}`);
+        console.warn(`[WARN] background.raw not found. Please upload it.`);
     }
 } catch (err) {
-    console.error(`[ERROR] Load Failed: ${err.message}`);
+    console.error(`[ERROR] File Load Failed: ${err.message}`);
 }
 
 // --- MIXER ---
 wss.on('connection', (ws) => {
-    console.log('[TWILIO] Connection Accepted');
+    console.log('[TWILIO] Stream Connected');
     
     let elevenLabsWs = null;
     let streamSid = null;
     let audioQueue = Buffer.alloc(0);
     let bgIndex = 0;
     let mixerInterval = null;
-    let logCounter = 0; // Limit logs so we don't crash
+    
+    // VARIABLES FOR YOUR UPSAMPLING LOGIC
+    let pcmInputQueue = Buffer.alloc(0);
+    let lastInputSample = 0;
 
     ws.on('message', (message) => {
         try {
@@ -105,7 +110,7 @@ wss.on('connection', (ws) => {
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected");
-                    mixerInterval = setInterval(mixAndStream, 20);
+                    if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
                 });
                 
                 elevenLabsWs.on('message', (data) => {
@@ -117,15 +122,32 @@ wss.on('connection', (ws) => {
                 });
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-                    const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // INPUT DEBUG: Are we receiving audio?
-                    if (logCounter < 5) console.log(`[INPUT] Received ${twilioData.length} bytes from Twilio`);
-                    
-                    const pcmData = Buffer.alloc(twilioData.length * 2);
-                    for (let i = 0; i < twilioData.length; i++) {
-                        pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
+                    // --- YOUR ORIGINAL INPUT LOGIC (UPSAMPLING 8k -> 16k) ---
+                    const twilioChunk = Buffer.from(msg.media.payload, 'base64');
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); // 2 bytes * 2 (doubling samples)
+
+                    for (let i = 0; i < twilioChunk.length; i++) {
+                        const currentSample = muLawToLinearTable[twilioChunk[i]];
+                        // Create a mid-point sample (Linear Interpolation)
+                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        
+                        // Write Mid-point (Upsample)
+                        pcmChunk.writeInt16LE(midPoint, i * 4);
+                        // Write Actual Sample
+                        pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
+                        
+                        lastInputSample = currentSample;
                     }
-                    elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcmData.toString('base64') }));
+
+                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
+
+                    // Send when we have enough data
+                    if (pcmInputQueue.length >= 1600) {
+                        elevenLabsWs.send(JSON.stringify({ 
+                            user_audio_chunk: pcmInputQueue.toString('base64') 
+                        }));
+                        pcmInputQueue = Buffer.alloc(0);
+                    }
                 }
             } else if (msg.event === 'stop') {
                 if (elevenLabsWs) elevenLabsWs.close();
@@ -148,46 +170,30 @@ wss.on('connection', (ws) => {
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
-        // --- DIAGNOSTIC LOGGING ---
-        // We log the very first sample of every 50th frame to see what's happening
-        let debugBgSample = 0;
-        let debugAiSample = 0;
-
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Read Background (Even if volume is 0, we read it to check values)
-            let bgSample = 0;
+            // 1. Add Background
             if (backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
-                bgSample = backgroundBuffer.readInt16LE(bgIndex);
+                const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                debugBgSample = bgSample; // Capture for log
+                
+                // Use 1.0 because your file is quiet. Use 0.05 if using original file.
+                sampleSum += (bgSample * BG_VOLUME);
             }
 
-            // 2. Read AI
-            let aiSample = 0;
+            // 2. Add AI Voice (NO BOOST)
             if (aiChunk) {
-                aiSample = muLawToLinearTable[aiChunk[i]];
-                debugAiSample = aiSample; // Capture for log
+                const aiSample = muLawToLinearTable[aiChunk[i]];
+                sampleSum += (aiSample * AI_VOLUME);
             }
 
-            // 3. MIX (With Mute applied)
-            sampleSum += (bgSample * BG_VOLUME); // This is 0.0 right now
-            sampleSum += (aiSample * AI_VOLUME);
-
-            // 4. Clip
+            // 3. Hard Clip
             if (sampleSum > 32700) sampleSum = 32700;
             if (sampleSum < -32700) sampleSum = -32700;
 
             mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
-        }
-
-        // --- PRINT THE DATA (Once per second approx) ---
-        logCounter++;
-        if (logCounter % 50 === 0) {
-             console.log(`[DIAGNOSTIC] BG Raw Value: ${debugBgSample} | AI Raw Value: ${debugAiSample}`);
-             if (Math.abs(debugBgSample) > 10000) console.warn(">>> WARNING: Background file is VERY LOUD! <<<");
         }
 
         ws.send(JSON.stringify({
@@ -198,4 +204,4 @@ wss.on('connection', (ws) => {
     }
 });
 
-server.listen(PORT, () => console.log(`[SYSTEM] Diagnostic Server on ${PORT}`));
+server.listen(PORT, () => console.log(`[SYSTEM] Server listening on ${PORT}`));
