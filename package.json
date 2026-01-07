@@ -1,14 +1,15 @@
 {
-  "name": "twilio-media-stream",
+  "name": "twilio-split-reality-stream",
   "version": "1.0.0",
+  "description": "Twilio Media Stream with Background Mixing and AI Split Reality",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "ws": "^8.13.0",
-    "wav": "^1.0.2"
+    "ws": "^8.13.0"
   },
   "engines": {
     "node": ">=16.0.0"
