@@ -8,10 +8,14 @@ const wav = require('wav');
 const PORT = process.env.PORT || 3000;
 
 // --- CONFIGURATION ---
-const BG_VOLUME = 0.02; // 2% Volume (Very quiet, safe for mixing)
-const INPUT_BOOST = 5.0; // Turbo Boost for your voice
+// 1. BASE VOLUME: 0.4% (5x quieter than before)
+const BG_VOLUME_NORMAL = 0.004; 
+// 2. DUCKED VOLUME: 0.1% (When AI is talking, music effectively disappears)
+const BG_VOLUME_DUCKED = 0.001; 
+// 3. INPUT BOOST: 5.0 (Helps AI hear you)
+const INPUT_BOOST = 5.0;
 
-// --- G.711 UTILITIES (Manual Math - No Library Issues) ---
+// --- G.711 UTILITIES ---
 function muLawToLinear(m) {
     m = ~m;
     let s = (m & 0x80) >> 7;
@@ -32,7 +36,7 @@ function linearToMuLaw(sample) {
     return ~(s | (e << 4) | n);
 }
 
-// --- ROBUST BACKGROUND LOADER ---
+// --- LOAD BACKGROUND AUDIO ---
 let bgBuffer = null;
 const fileStream = fs.createReadStream(path.join(__dirname, 'background.wav'));
 const reader = new wav.Reader();
@@ -44,7 +48,7 @@ reader.on('format', function (format) {
         else bgBuffer = Buffer.concat([bgBuffer, chunk]);
     });
     reader.on('end', function () {
-        // Convert to Int16Array for easy mixing
+        // Convert to Int16Array
         const temp = new Int16Array(bgBuffer.buffer, bgBuffer.byteOffset, bgBuffer.length / 2);
         bgBuffer = temp;
         console.log(`[SYSTEM] Background Audio Ready: ${bgBuffer.length} samples`);
@@ -55,8 +59,7 @@ fileStream.pipe(reader);
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.get('/', (req, res) => res.send("Split Reality Server Online"));
-
+app.get('/', (req, res) => res.send("Ducking Server Online"));
 app.post('/incoming-call', (req, res) => {
     res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${req.headers.host}/media-stream" /></Connect></Response>`);
 });
@@ -68,10 +71,10 @@ wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
     let elevenLabsWs = null;
     let streamSid = null;
-    let aiQueue = []; // Array of Linear Samples
+    let aiQueue = []; 
     let bgIndex = 0;
     let lastInputSample = 0;
-    let heartbeat = null;
+    let outputInterval = null;
 
     ws.on('message', (message) => {
         const msg = JSON.parse(message);
@@ -84,24 +87,24 @@ wss.on('connection', (ws) => {
 
             elevenLabsWs.on('open', () => {
                 console.log("[11LABS] Connected");
-                // Start the Heartbeat (Constant Music)
-                if (!heartbeat) heartbeat = setInterval(sendMixedAudio, 20);
+                if (!outputInterval) outputInterval = setInterval(sendMixedAudio, 20);
             });
 
             elevenLabsWs.on('message', (data) => {
                 const aiMsg = JSON.parse(data);
                 if (aiMsg.audio_event?.audio_base64_chunk) {
                     const chunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
-                    // Immediately decode to Linear PCM
+                    // Decode AI audio immediately
                     for (let i = 0; i < chunk.length; i++) {
                         aiQueue.push(muLawToLinear(chunk[i]));
                     }
                 }
             });
         } 
+        
         else if (msg.event === 'media') {
             if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-                // --- INPUT: Turbo Mode (Upsample 8k -> 16k + Boost) ---
+                // INPUT: Turbo Mode (Upsample 8k -> 16k + Boost)
                 const twilioData = Buffer.from(msg.media.payload, 'base64');
                 const pcm = Buffer.alloc(twilioData.length * 4);
                 
@@ -109,7 +112,6 @@ wss.on('connection', (ws) => {
                     let s = muLawToLinear(twilioData[i]) * INPUT_BOOST;
                     if (s > 32767) s = 32767; if (s < -32768) s = -32768;
                     
-                    // Upsample
                     pcm.writeInt16LE(Math.floor((lastInputSample + s) / 2), i * 4);
                     pcm.writeInt16LE(s, i * 4 + 2);
                     lastInputSample = s;
@@ -117,43 +119,50 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcm.toString('base64') }));
             }
         }
+        
         else if (msg.event === 'stop') {
             if (elevenLabsWs) elevenLabsWs.close();
-            if (heartbeat) clearInterval(heartbeat);
+            if (outputInterval) clearInterval(outputInterval);
         }
     });
 
     ws.on('close', () => {
         if (elevenLabsWs) elevenLabsWs.close();
-        if (heartbeat) clearInterval(heartbeat);
+        if (outputInterval) clearInterval(outputInterval);
     });
 
-    // --- THE MIXER ---
+    // --- THE DUCKING MIXER ---
     function sendMixedAudio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
 
-        const CHUNK_SIZE = 160; // 20ms at 8000Hz
+        const CHUNK_SIZE = 160; 
         const outputBuffer = Buffer.alloc(CHUNK_SIZE);
+
+        // CHECK: Is AI Talking?
+        // If queue has data, we are in "Speaking Mode"
+        const isAiTalking = (aiQueue.length > 0);
+        
+        // SELECT VOLUME: If talking, drop music to almost zero.
+        const currentBgVolume = isAiTalking ? BG_VOLUME_DUCKED : BG_VOLUME_NORMAL;
 
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let mixed = 0;
 
-            // 1. Add Background (Very Quiet)
+            // 1. Add Background (With Dynamic Volume)
             if (bgBuffer && bgBuffer.length > 0) {
-                mixed += bgBuffer[bgIndex] * BG_VOLUME;
+                mixed += bgBuffer[bgIndex] * currentBgVolume;
                 bgIndex = (bgIndex + 1) % bgBuffer.length;
             }
 
-            // 2. Add AI Voice (If available)
+            // 2. Add AI Voice (Priority)
             if (aiQueue.length > 0) {
                 mixed += aiQueue.shift();
             }
 
-            // 3. Clamp (Safety)
+            // 3. Clamp
             if (mixed > 32767) mixed = 32767;
             if (mixed < -32768) mixed = -32768;
 
-            // 4. Encode to Mu-Law
             outputBuffer[i] = linearToMuLaw(mixed);
         }
 
