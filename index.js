@@ -1,6 +1,6 @@
 /**
- * Title: Split Reality Engine (Distortion Fix)
- * Description: Volume lowered to 1% to prevent digital clipping.
+ * Title: Split Reality Engine (Twilio Optimized)
+ * Description: Uses pre-processed quiet audio to maximize quality.
  */
 
 require('dotenv').config();
@@ -12,8 +12,10 @@ const https = require('https');
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
-const AI_VOLUME = 1.0;          // AI Voice (100%)
-const BG_VOLUME = 0.01;         // Background Music (1%) <- FIXED: Reduced from 0.05
+const AI_VOLUME = 1.0;
+// CHANGED: We set this to 1.0 because the file is already quiet (5%)!
+const BG_VOLUME = 1.0; 
+// CRITICAL: MUST be the 'raw.githubusercontent.com' link
 const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 const app = express();
@@ -34,7 +36,7 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- DSP ENGINE (G.711) ---
+// --- DSP ENGINE (G.711 LUT) ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
@@ -71,7 +73,7 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- BACKGROUND LOADER ---
+// --- SAFE BACKGROUND LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 let isBackgroundValid = false;
 
@@ -81,13 +83,14 @@ https.get(BG_URL, (res) => {
     res.on('data', chunk => data.push(chunk));
     res.on('end', () => {
         const fullBuffer = Buffer.concat(data);
-        // Safety check for HTML/Text
+        // Security Check: Is this an HTML error page?
         const startString = fullBuffer.subarray(0, 50).toString('utf-8');
         if (startString.includes("<!DOCTYPE") || startString.includes("<html")) {
-            console.error("[CRITICAL] URL is returning a webpage, not audio.");
+            console.error("[CRITICAL] The URL pointed to a WEBPAGE, not raw audio.");
+            console.error("[ACTION] Background disabled to prevent static.");
             isBackgroundValid = false;
         } else {
-            console.log(`[SYSTEM] Background Audio Verified! (${fullBuffer.length} bytes)`);
+            console.log(`[SYSTEM] Background Verified! (${fullBuffer.length} bytes)`);
             backgroundBuffer = fullBuffer;
             isBackgroundValid = true;
         }
@@ -115,7 +118,7 @@ wss.on('connection', (ws) => {
                 elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
 
                 elevenLabsWs.on('open', () => {
-                    console.log("[11LABS] AI Connected");
+                    console.log("[11LABS] Connected");
                     if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
                 });
                 
@@ -129,7 +132,7 @@ wss.on('connection', (ws) => {
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // Send Clean Audio to AI (No Mix)
+                    // Convert to Linear PCM for 11Labs
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
                         pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
@@ -160,14 +163,14 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background (Very Quiet)
+            // 1. Add Background (Pre-lowered in file)
             if (isBackgroundValid && backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
                 
-                // Add background with volume limit
-                sampleSum += (bgSample * BG_VOLUME);
+                // No math needed here anymore (or very little)
+                sampleSum += (bgSample * BG_VOLUME); 
             }
 
             // 2. Add AI Voice
@@ -175,8 +178,7 @@ wss.on('connection', (ws) => {
                 sampleSum += muLawToLinearTable[aiChunk[i]] * AI_VOLUME;
             }
 
-            // 3. Soft Clip (Prevents "Crunchy" Distortion)
-            // If the volume is too loud, we squash it gently instead of chopping it off
+            // 3. Soft Clip
             if (sampleSum > 32700) sampleSum = 32700;
             if (sampleSum < -32700) sampleSum = -32700;
 
@@ -191,4 +193,4 @@ wss.on('connection', (ws) => {
     }
 });
 
-server.listen(PORT, () => console.log(`[SYSTEM] Listening on ${PORT}`));
+server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
