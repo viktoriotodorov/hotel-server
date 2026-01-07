@@ -1,4 +1,4 @@
-// index.js (Split Reality Engine: Production Ready)
+// index.js (Split Reality Engine: Volume Fixed + Input Fixed)
 require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
@@ -7,19 +7,17 @@ const https = require('https');
 
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURATION ---
-const AI_VOLUME = 1.0;        // 1.0 = 100% (No Boost, No Distortion)
-const BG_VOLUME = 0.1;        // 0.1 = 10% (Subtle background)
-// REPLACE THIS URL WITH YOUR RAW FILE URL
+// --- CRITICAL SETTINGS ---
+const AI_VOLUME = 1.0; 
+// FIX 1: Lowered Background from 0.1 to 0.02 (Much quieter)
+const BG_VOLUME = 0.02; 
 const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// Root Route
 app.get('/', (req, res) => res.send("Split Reality Audio Server Online"));
 
-// Twilio Incoming Call Route
 app.post('/incoming-call', (req, res) => {
     const callerId = req.body.From || "Unknown";
     console.log(`[TWILIO] Incoming call from: ${callerId}`);
@@ -35,11 +33,11 @@ app.post('/incoming-call', (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- AUDIO PROCESSING TABLES (G.711 u-Law) ---
+// --- AUDIO LOOKUP TABLES ---
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 
-// 1. Generate Decode Table (u-Law -> Linear)
+// Generate Decode Table (u-Law -> Linear)
 for (let i = 0; i < 256; i++) {
     let muLawByte = ~i; 
     let sign = (muLawByte & 0x80) >> 7;
@@ -49,8 +47,7 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -sample : sample;
 }
 
-// 2. Generate Encode Table (Linear -> u-Law)
-// We precompute this to save CPU during the call
+// Generate Encode Table (Linear -> u-Law)
 const linearToMuLaw = (sample) => {
     const BIAS = 0x84;
     const CLIP = 32635;
@@ -69,25 +66,20 @@ const linearToMuLaw = (sample) => {
     return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 };
 
-// Fill the encode table
 for (let i = -32768; i <= 32767; i++) {
-    // Offset by 32768 to map array index (0-65535) to int16 range
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
 // --- BACKGROUND AUDIO LOADER ---
 let backgroundBuffer = Buffer.alloc(0);
 
-console.log(`[SYSTEM] Downloading Background Raw Audio from: ${BG_URL}`);
+console.log(`[SYSTEM] Downloading Background Raw Audio...`);
 https.get(BG_URL, (res) => {
     const data = [];
     res.on('data', chunk => data.push(chunk));
     res.on('end', () => {
         backgroundBuffer = Buffer.concat(data);
-        console.log(`[SYSTEM] Background Loaded! Size: ${backgroundBuffer.length} bytes.`);
-        if (backgroundBuffer.length < 1000) {
-            console.warn("[WARN] Background file seems too small. Check URL.");
-        }
+        console.log(`[SYSTEM] Background Loaded! ${backgroundBuffer.length} bytes.`);
     });
 }).on('error', err => console.error("[ERROR] Failed to download background:", err.message));
 
@@ -110,7 +102,6 @@ wss.on('connection', (ws) => {
                 streamSid = msg.start.streamSid;
                 console.log(`[TWILIO] Stream ID: ${streamSid}`);
 
-                // Connect to ElevenLabs (Asking for u-law 8000Hz)
                 const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
                     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
@@ -118,22 +109,19 @@ wss.on('connection', (ws) => {
 
                 elevenLabsWs.on('open', () => {
                     console.log("[11LABS] Connected to AI Agent");
-                    // Start the Heartbeat Mixer immediately
                     if (!mixerInterval) {
-                        mixerInterval = setInterval(mixAndStream, 20); // 20ms Loop
+                        mixerInterval = setInterval(mixAndStream, 20); 
                     }
                 });
                 
-                // Handle AI Responses
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
-                    
-                    // Extract Audio from 11Labs Message
+                    // Check if AI is sending audio
                     let chunkData = null;
                     if (aiMsg.audio_event?.audio_base64_chunk) chunkData = aiMsg.audio_event.audio_base64_chunk;
-                    else if (aiMsg.audio_event?.audio) chunkData = aiMsg.audio_event.audio;
                     
                     if (chunkData) {
+                        // console.log("[11LABS] Received Audio Chunk"); // Uncomment to debug
                         const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
                     }
@@ -143,13 +131,20 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
-                // --- SPLIT REALITY INPUT STRATEGY ---
-                // We send the caller's audio DIRECTLY to ElevenLabs.
-                // We DO NOT mix the hotel lobby sound here.
-                // This ensures the AI has "perfect hearing".
+                // --- FIX 2: INPUT TRANSLATION (u-Law -> PCM) ---
+                // We must decode Twilio audio before sending to AI, 
+                // otherwise the AI just hears static and won't respond.
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                    const twilioData = Buffer.from(msg.media.payload, 'base64');
+                    const pcmData = Buffer.alloc(twilioData.length * 2); // 16-bit = 2 bytes
+
+                    for (let i = 0; i < twilioData.length; i++) {
+                        const linearSample = muLawToLinearTable[twilioData[i]];
+                        pcmData.writeInt16LE(linearSample, i * 2);
+                    }
+
                     const payload = {
-                        user_audio_chunk: msg.media.payload // Send raw base64 u-law
+                        user_audio_chunk: pcmData.toString('base64')
                     };
                     elevenLabsWs.send(JSON.stringify(payload));
                 }
@@ -168,17 +163,14 @@ wss.on('connection', (ws) => {
         console.log("[TWILIO] Client Disconnected");
     });
 
-    // --- THE MIXER (Heartbeat) ---
-    // Runs every 20ms to send audio to the caller.
-    // It mixes the Hotel Lobby + AI Voice (if speaking).
+    // --- THE MIXER ---
     function mixAndStream() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
         
-        // G.711 u-law is 8000Hz. 20ms = 160 samples.
         const SAMPLES_PER_CHUNK = 160; 
-        const mixedBuffer = Buffer.alloc(SAMPLES_PER_CHUNK); // Output buffer (u-law is 1 byte per sample)
+        const mixedBuffer = Buffer.alloc(SAMPLES_PER_CHUNK); 
 
-        // 1. Get AI Audio (if available)
+        // 1. Get AI Audio
         let aiChunk = null;
         if (audioQueue.length >= SAMPLES_PER_CHUNK) {
             aiChunk = audioQueue.subarray(0, SAMPLES_PER_CHUNK);
@@ -191,31 +183,28 @@ wss.on('connection', (ws) => {
 
             // A. Background Layer
             if (backgroundBuffer.length > 0) {
-                // Read 16-bit Little Endian (2 bytes)
-                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; // Loop
+                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
                 
+                // Low volume mixing
                 sampleSum += (bgSample * BG_VOLUME);
             }
 
             // B. AI Layer
             if (aiChunk) {
-                // Decode u-law byte to linear integer
                 const aiSample = muLawToLinearTable[aiChunk[i]];
                 sampleSum += (aiSample * AI_VOLUME);
             }
 
-            // C. Hard Limiting (Prevent Distortion/Crackle)
+            // C. Hard Limiting
             if (sampleSum > 32767) sampleSum = 32767;
             if (sampleSum < -32768) sampleSum = -32768;
 
-            // D. Encode back to u-Law
-            // We use the offset +32768 to handle negative indices for the lookup table
+            // D. Encode
             mixedBuffer[i] = linearToMuLawTable[Math.floor(sampleSum) + 32768];
         }
 
-        // 3. Send to Twilio
         ws.send(JSON.stringify({
             event: 'media',
             streamSid: streamSid,
@@ -225,4 +214,3 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
-
