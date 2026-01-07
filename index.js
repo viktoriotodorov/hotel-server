@@ -1,22 +1,20 @@
 /**
- * Title: Split Reality Engine (Twilio Optimized)
- * Description: Uses pre-processed quiet audio to maximize quality.
+ * Title: Split Reality Engine (Local File Edition)
+ * Description: Loads audio from disk for maximum stability.
  */
 
 require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
-const https = require('https');
+const fs = require('fs');       // Added File System module
+const path = require('path');   // Added Path module
 
 const PORT = process.env.PORT || 8080;
 
 // --- CONFIGURATION ---
 const AI_VOLUME = 1.0;
-// CHANGED: We set this to 1.0 because the file is already quiet (5%)!
-const BG_VOLUME = 1.0; 
-// CRITICAL: MUST be the 'raw.githubusercontent.com' link
-const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
+const BG_VOLUME = 1.0; // File is already pre-quieted to 5% via ffmpeg
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -73,30 +71,29 @@ for (let i = -32768; i <= 32767; i++) {
     linearToMuLawTable[i + 32768] = linearToMuLaw(i);
 }
 
-// --- SAFE BACKGROUND LOADER ---
+// --- LOCAL FILE LOADER (The Fix) ---
 let backgroundBuffer = Buffer.alloc(0);
 let isBackgroundValid = false;
 
-console.log(`[SYSTEM] Downloading Background...`);
-https.get(BG_URL, (res) => {
-    const data = [];
-    res.on('data', chunk => data.push(chunk));
-    res.on('end', () => {
-        const fullBuffer = Buffer.concat(data);
-        // Security Check: Is this an HTML error page?
-        const startString = fullBuffer.subarray(0, 50).toString('utf-8');
-        if (startString.includes("<!DOCTYPE") || startString.includes("<html")) {
-            console.error("[CRITICAL] The URL pointed to a WEBPAGE, not raw audio.");
-            console.error("[ACTION] Background disabled to prevent static.");
-            isBackgroundValid = false;
-        } else {
-            console.log(`[SYSTEM] Background Verified! (${fullBuffer.length} bytes)`);
-            backgroundBuffer = fullBuffer;
-            isBackgroundValid = true;
-        }
-    });
-}).on('error', err => console.error("[ERROR] Network error:", err.message));
-
+// We load the file immediately when the server starts
+try {
+    const filePath = path.join(__dirname, 'background.raw');
+    
+    // Check if file exists
+    if (fs.existsSync(filePath)) {
+        console.log(`[SYSTEM] Loading background audio from disk: ${filePath}`);
+        backgroundBuffer = fs.readFileSync(filePath);
+        console.log(`[SYSTEM] Background Loaded! Size: ${backgroundBuffer.length} bytes.`);
+        isBackgroundValid = true;
+    } else {
+        console.error(`[CRITICAL] background.raw not found at ${filePath}`);
+        console.error(`[ACTION] Make sure you uploaded background.raw to your GitHub repo!`);
+        isBackgroundValid = false;
+    }
+} catch (err) {
+    console.error(`[ERROR] Failed to load background file: ${err.message}`);
+    isBackgroundValid = false;
+}
 
 // --- MIXER ---
 wss.on('connection', (ws) => {
@@ -132,7 +129,7 @@ wss.on('connection', (ws) => {
             } else if (msg.event === 'media') {
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioData = Buffer.from(msg.media.payload, 'base64');
-                    // Convert to Linear PCM for 11Labs
+                    // Send Clean Audio to AI (No Mix)
                     const pcmData = Buffer.alloc(twilioData.length * 2);
                     for (let i = 0; i < twilioData.length; i++) {
                         pcmData.writeInt16LE(muLawToLinearTable[twilioData[i]], i * 2);
@@ -163,14 +160,12 @@ wss.on('connection', (ws) => {
         for (let i = 0; i < CHUNK_SIZE; i++) {
             let sampleSum = 0;
 
-            // 1. Add Background (Pre-lowered in file)
+            // 1. Add Background
             if (isBackgroundValid && backgroundBuffer.length > 0) {
                 if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
                 const bgSample = backgroundBuffer.readInt16LE(bgIndex);
                 bgIndex += 2;
-                
-                // No math needed here anymore (or very little)
-                sampleSum += (bgSample * BG_VOLUME); 
+                sampleSum += (bgSample * BG_VOLUME);
             }
 
             // 2. Add AI Voice
