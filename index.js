@@ -1,175 +1,236 @@
+// index.js (Final Cloud: Constant Ambience + Turbo Mode)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const wav = require('wav');
+const https = require('https');
 
 const PORT = process.env.PORT || 3000;
 
-// --- CONFIGURATION ---
-// 1. BASE VOLUME: 0.4% (5x quieter than before)
-const BG_VOLUME_NORMAL = 0.004; 
-// 2. DUCKED VOLUME: 0.1% (When AI is talking, music effectively disappears)
-const BG_VOLUME_DUCKED = 0.001; 
-// 3. INPUT BOOST: 5.0 (Helps AI hear you)
-const INPUT_BOOST = 5.0;
-
-// --- G.711 UTILITIES ---
-function muLawToLinear(m) {
-    m = ~m;
-    let s = (m & 0x80) >> 7;
-    let e = (m & 0x70) >> 4;
-    let n = m & 0x0F;
-    let sample = (n * 2 + 33) * (1 << e) - 33;
-    return s === 0 ? -sample : sample;
-}
-
-function linearToMuLaw(sample) {
-    let s = (sample >> 8) & 0x80;
-    if (s !== 0) sample = -sample;
-    if (sample > 32635) sample = 32635;
-    sample += 0x84;
-    let e = 7;
-    for (let m = 0x4000; e !== 0 && (sample & m) === 0; e--, m >>= 1);
-    let n = (sample >> (e + 3)) & 0x0F;
-    return ~(s | (e << 4) | n);
-}
-
-// --- LOAD BACKGROUND AUDIO ---
-let bgBuffer = null;
-const fileStream = fs.createReadStream(path.join(__dirname, 'background.wav'));
-const reader = new wav.Reader();
-
-reader.on('format', function (format) {
-    console.log(`[SYSTEM] WAV Format: ${format.sampleRate}Hz ${format.bitDepth}-bit`);
-    reader.on('data', function (chunk) {
-        if (!bgBuffer) bgBuffer = chunk;
-        else bgBuffer = Buffer.concat([bgBuffer, chunk]);
-    });
-    reader.on('end', function () {
-        // Convert to Int16Array
-        const temp = new Int16Array(bgBuffer.buffer, bgBuffer.byteOffset, bgBuffer.length / 2);
-        bgBuffer = temp;
-        console.log(`[SYSTEM] Background Audio Ready: ${bgBuffer.length} samples`);
-    });
-});
-fileStream.pipe(reader);
-
-
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.get('/', (req, res) => res.send("Ducking Server Online"));
+
+app.get('/', (req, res) => res.send("Server Online: Constant Ambience Mode"));
+
 app.post('/incoming-call', (req, res) => {
-    res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${req.headers.host}/media-stream" /></Connect></Response>`);
+    const callerId = req.body.From || "Unknown";
+    console.log(`[TWILIO] Call from: ${callerId}`);
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Connect>
+          <Stream url="wss://${req.headers.host}/media-stream" />
+        </Connect>
+      </Response>`;
+    res.type('text/xml').send(twiml);
 });
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// --- MU-LAW LOOKUP TABLE WITH VOLUME BOOST ---
+const muLawToLinearTable = new Int16Array(256);
+const VOLUME_BOOST = 5.0; 
+
+for (let i = 0; i < 256; i++) {
+    let muLawByte = ~i; 
+    let sign = (muLawByte & 0x80) >> 7;
+    let exponent = (muLawByte & 0x70) >> 4;
+    let mantissa = muLawByte & 0x0F;
+    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
+    sample = sign === 0 ? -sample : sample;
+    sample = sample * VOLUME_BOOST;
+    if (sample > 32767) sample = 32767;
+    if (sample < -32768) sample = -32768;
+    muLawToLinearTable[i] = sample;
+}
+
+// --- LINEAR TO MU-LAW ENCODER ---
+const linearToMuLaw = (sample) => {
+    const BIAS = 0x84;
+    const CLIP = 32635;
+    sample = (sample < -CLIP) ? -CLIP : (sample > CLIP) ? CLIP : sample;
+    const sign = (sample < 0) ? 0x80 : 0;
+    sample = (sample < 0) ? -sample : sample;
+    sample += BIAS;
+    let exponent = 7;
+    let exponent_bits = 0;
+    for (let exp = 0; exp < 8; exp++) {
+        if (sample < (1 << (exp + 5))) {
+            exponent = exp;
+            break;
+        }
+    }
+    if (sample > 32767) sample = 32767;
+    if (sample >= 32768) exponent_bits = 7;
+    else if (sample >= 16384) exponent_bits = 6;
+    else if (sample >= 8192) exponent_bits = 5;
+    else if (sample >= 4096) exponent_bits = 4;
+    else if (sample >= 2048) exponent_bits = 3;
+    else if (sample >= 1024) exponent_bits = 2;
+    else if (sample >= 512) exponent_bits = 1;
+    else exponent_bits = 0;
+
+    const mantissa_bits = (sample >> (exponent_bits + 3)) & 0x0F;
+    return ~(sign | (exponent_bits << 4) | mantissa_bits) & 0xFF;
+};
+
+// --- BACKGROUND LOADER ---
+let backgroundBuffer = Buffer.alloc(0);
+console.log("[SYSTEM] Downloading Background Sound...");
+https.get("https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.wav", (res) => {
+    const data = [];
+    res.on('data', chunk => data.push(chunk));
+    res.on('end', () => {
+        // Assume 16-bit PCM WAV. Strip header (~44 bytes)
+        const fullFile = Buffer.concat(data);
+        if (fullFile.length > 100) {
+            backgroundBuffer = fullFile.subarray(44); 
+            console.log(`[SYSTEM] Background Sound Loaded! (${backgroundBuffer.length} bytes)`);
+        }
+    });
+}).on('error', err => console.log("[SYSTEM] No Background Sound found."));
+
+
 wss.on('connection', (ws) => {
     console.log("[TWILIO] Client Connected");
+    
     let elevenLabsWs = null;
     let streamSid = null;
-    let aiQueue = []; 
-    let bgIndex = 0;
+    let audioQueue = Buffer.alloc(0); 
+    let pcmInputQueue = Buffer.alloc(0);
     let lastInputSample = 0;
-    let outputInterval = null;
+    let bgIndex = 0;
+    let outputIntervalId = null;
 
     ws.on('message', (message) => {
-        const msg = JSON.parse(message);
+        try {
+            const msg = JSON.parse(message);
 
-        if (msg.event === 'start') {
-            streamSid = msg.start.streamSid;
-            // ElevenLabs Connection
-            const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
-            elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
+            if (msg.event === 'start') {
+                streamSid = msg.start.streamSid;
+                console.log(`[TWILIO] Stream Started!`);
 
-            elevenLabsWs.on('open', () => {
-                console.log("[11LABS] Connected");
-                if (!outputInterval) outputInterval = setInterval(sendMixedAudio, 20);
-            });
+                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
+                elevenLabsWs = new WebSocket(url, {
+                    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
+                });
 
-            elevenLabsWs.on('message', (data) => {
-                const aiMsg = JSON.parse(data);
-                if (aiMsg.audio_event?.audio_base64_chunk) {
-                    const chunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
-                    // Decode AI audio immediately
-                    for (let i = 0; i < chunk.length; i++) {
-                        aiQueue.push(muLawToLinear(chunk[i]));
+                elevenLabsWs.on('open', () => {
+                    console.log("[11LABS] Connected");
+                    // START THE HEARTBEAT IMMEDIATELY
+                    // This ensures background noise plays even before the AI speaks
+                    if (!outputIntervalId) {
+                        outputIntervalId = setInterval(streamAudioToTwilio, 20);
+                    }
+                });
+                
+                elevenLabsWs.on('message', (data) => {
+                    const aiMsg = JSON.parse(data);
+                    
+                    let chunkData = null;
+                    if (aiMsg.audio_event) {
+                        if (aiMsg.audio_event.audio_base64_chunk) {
+                            chunkData = aiMsg.audio_event.audio_base64_chunk;
+                        } else if (aiMsg.audio_event.audio) chunkData = aiMsg.audio_event.audio;
+                        else {
+                            const keys = Object.keys(aiMsg.audio_event);
+                            for (const key of keys) {
+                                const val = aiMsg.audio_event[key];
+                                if (typeof val === 'string' && val.length > 100) {
+                                    chunkData = val;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (chunkData) {
+                        const newChunk = Buffer.from(chunkData, 'base64');
+                        audioQueue = Buffer.concat([audioQueue, newChunk]);
+                    }
+                });
+
+                elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
+                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
+
+            } else if (msg.event === 'media') {
+                if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                    // --- INPUT PROCESSING (Clean Voice -> AI) ---
+                    const twilioChunk = Buffer.from(msg.media.payload, 'base64');
+                    const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
+
+                    for (let i = 0; i < twilioChunk.length; i++) {
+                        const currentSample = muLawToLinearTable[twilioChunk[i]];
+                        const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        pcmChunk.writeInt16LE(midPoint, i * 4);
+                        pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
+                        lastInputSample = currentSample;
+                    }
+
+                    pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
+
+                    if (pcmInputQueue.length >= 1600) {
+                        elevenLabsWs.send(JSON.stringify({ 
+                            user_audio_chunk: pcmInputQueue.toString('base64') 
+                        }));
+                        pcmInputQueue = Buffer.alloc(0);
                     }
                 }
-            });
-        } 
-        
-        else if (msg.event === 'media') {
-            if (elevenLabsWs?.readyState === WebSocket.OPEN) {
-                // INPUT: Turbo Mode (Upsample 8k -> 16k + Boost)
-                const twilioData = Buffer.from(msg.media.payload, 'base64');
-                const pcm = Buffer.alloc(twilioData.length * 4);
-                
-                for (let i = 0; i < twilioData.length; i++) {
-                    let s = muLawToLinear(twilioData[i]) * INPUT_BOOST;
-                    if (s > 32767) s = 32767; if (s < -32768) s = -32768;
-                    
-                    pcm.writeInt16LE(Math.floor((lastInputSample + s) / 2), i * 4);
-                    pcm.writeInt16LE(s, i * 4 + 2);
-                    lastInputSample = s;
-                }
-                elevenLabsWs.send(JSON.stringify({ user_audio_chunk: pcm.toString('base64') }));
+            } else if (msg.event === 'stop') {
+                if (elevenLabsWs) elevenLabsWs.close();
+                clearInterval(outputIntervalId);
             }
-        }
-        
-        else if (msg.event === 'stop') {
-            if (elevenLabsWs) elevenLabsWs.close();
-            if (outputInterval) clearInterval(outputInterval);
+        } catch (e) {
+            console.error(e);
         }
     });
 
-    ws.on('close', () => {
-        if (elevenLabsWs) elevenLabsWs.close();
-        if (outputInterval) clearInterval(outputInterval);
-    });
+    ws.on('close', () => clearInterval(outputIntervalId));
 
-    // --- THE DUCKING MIXER ---
-    function sendMixedAudio() {
+    // --- CONSTANT HEARTBEAT MIXER ---
+    function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
-
-        const CHUNK_SIZE = 160; 
-        const outputBuffer = Buffer.alloc(CHUNK_SIZE);
-
-        // CHECK: Is AI Talking?
-        // If queue has data, we are in "Speaking Mode"
-        const isAiTalking = (aiQueue.length > 0);
         
-        // SELECT VOLUME: If talking, drop music to almost zero.
-        const currentBgVolume = isAiTalking ? BG_VOLUME_DUCKED : BG_VOLUME_NORMAL;
+        const CHUNK_SIZE = 160; 
+        const mixedBuffer = Buffer.alloc(CHUNK_SIZE);
 
-        for (let i = 0; i < CHUNK_SIZE; i++) {
-            let mixed = 0;
+        // 1. Get Background Sound (ALWAYS)
+        let hasBackground = false;
+        if (backgroundBuffer.length > 0) hasBackground = true;
 
-            // 1. Add Background (With Dynamic Volume)
-            if (bgBuffer && bgBuffer.length > 0) {
-                mixed += bgBuffer[bgIndex] * currentBgVolume;
-                bgIndex = (bgIndex + 1) % bgBuffer.length;
-            }
-
-            // 2. Add AI Voice (Priority)
-            if (aiQueue.length > 0) {
-                mixed += aiQueue.shift();
-            }
-
-            // 3. Clamp
-            if (mixed > 32767) mixed = 32767;
-            if (mixed < -32768) mixed = -32768;
-
-            outputBuffer[i] = linearToMuLaw(mixed);
+        // 2. Get AI Audio (IF AVAILABLE)
+        let aiChunk = null;
+        if (audioQueue.length >= CHUNK_SIZE) {
+            aiChunk = audioQueue.subarray(0, CHUNK_SIZE);
+            audioQueue = audioQueue.subarray(CHUNK_SIZE);
         }
 
-        ws.send(JSON.stringify({ 
-            event: 'media', 
-            streamSid: streamSid, 
-            media: { payload: outputBuffer.toString('base64') } 
+        // 3. Mix Them
+        for (let i = 0; i < CHUNK_SIZE; i++) {
+            let sample = 0;
+
+            // Add Background
+            if (hasBackground) {
+                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0;
+                const bgSample = backgroundBuffer.readInt16LE(bgIndex);
+                bgIndex += 2;
+                sample += (bgSample * 0.15); // 15% Volume
+            }
+
+            // Add AI Voice
+            if (aiChunk) {
+                // Decode AI (already boosted)
+                const aiSample = muLawToLinearTable[aiChunk[i]];
+                sample += aiSample;
+            }
+
+            // Encode & Send
+            mixedBuffer[i] = linearToMuLaw(sample);
+        }
+
+        ws.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: mixedBuffer.toString('base64') }
         }));
     }
 });
