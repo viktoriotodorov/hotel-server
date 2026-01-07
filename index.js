@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 const AI_VOLUME = 1.0;        // 1.0 = 100% (No Boost, No Distortion)
 const BG_VOLUME = 0.1;        // 0.1 = 10% (Subtle background)
 // REPLACE THIS URL WITH YOUR RAW FILE URL
-const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/hotel_lobby_8k.wav"; 
+const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -225,3 +225,4 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => console.log(`[SYSTEM] Server listening on port ${PORT}`));
+
