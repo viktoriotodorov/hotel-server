@@ -1,348 +1,227 @@
 /**
- * Title: Robust Real-Time Audio Mixer for Twilio Media Streams
- * Description: Implements Packet Clock architecture, G.711 u-law LUTs, and RIFF parsing.
- * Architecture: Input-Driven (Drift elimination)
+ * Title: Split Reality AI Engine (High-Fidelity)
+ * Description: Connects Caller to ElevenLabs AI while mixing background audio.
+ * Architecture: Packet-Clocked (Drift elimination)
  * DSP: Lookup Table based G.711 transcoding
  */
 
 const WebSocket = require('ws');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const https = require('https'); // Added for downloading raw file
 require('dotenv').config();
 
-// Configuration
-const HTTP_PORT = process.env.PORT |
+const PORT = process.env.PORT || 8080;
 
-| 8080;
-// Background file MUST be 8000Hz, 16-bit, Mono, PCM (Uncompressed)
-const BACKGROUND_FILE_PATH = path.join(__dirname, 'background.wav'); 
+// --- CONFIGURATION ---
+const AI_VOLUME = 1.0; 
+const BG_VOLUME = 0.02; // Keep this low (2%) for a subtle effect
+// Use your RAW file URL here
+const BG_URL = "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/background.raw"; 
 
 // ============================================================================
-// PART 1: G.711 MU-LAW DSP ENGINE (Lookup Table Generation)
+// PART 1: G.711 MU-LAW DSP ENGINE (Corrected)
 // ============================================================================
-// Reference: ITU-T Recommendation G.711
-// Analysis: Pre-computing these tables saves millions of CPU cycles per call.
-
 class MuLawCoder {
     constructor() {
         this.mu2linear = new Int16Array(256);
-        this.linear2mu = new Uint8Array(16384); // Covers 14-bit linear range
+        this.linear2mu = new Uint8Array(65536); // Covers full 16-bit range for safety
         this.generateTables();
     }
 
-    /**
-     * Generates the Lookup Tables according to G.711 specification.
-     * Maps 8-bit compressed u-law to 14-bit linear PCM and vice versa.
-     */
     generateTables() {
-        const BIAS = 0x84; // 132
+        const BIAS = 0x84;
         const CLIP = 32635;
 
-        // 1. Generate mu-law to Linear (Expansion) Table
-        // Iterates through all 256 possible byte values.
+        // 1. Generate mu-law to Linear (Expansion)
         for (let i = 0; i < 256; i++) {
-            let mu = ~i; // Invert the bits (u-law is one's complement)
+            let mu = ~i;
             let sign = (mu & 0x80) >> 7;
             let exponent = (mu & 0x70) >> 4;
             let mantissa = mu & 0x0F;
-            
-            // The G.711 expansion formula
             let sample = ((mantissa << 3) + 0x84) << exponent;
             sample -= 0x84;
-            
             if (sign) sample = -sample;
-            
-            // Store as signed 16-bit integer
             this.mu2linear[i] = sample;
         }
 
-        // 2. Generate Linear to mu-law (Compression) Table
-        // We map a simplified 14-bit linear space to 8-bit mu-law.
-        // The array index represents the linear value (offset by 8192 to handle negative indices).
-        for (let i = 0; i < 16384; i++) {
-            // Normalize input to 14-bit range (-8192 to +8191)
-            let sample = i - 8192; 
-            let sign = (sample < 0)? 0x80 : 0x00;
-            if (sample < 0) sample = -sample;
-            
-            // Apply clipping for safety (Standard G.711 clip)
-            if (sample > CLIP) sample = CLIP;
-            
+        // 2. Generate Linear to mu-law (Compression)
+        // Helper function for single sample
+        const encodeSample = (sample) => {
+            sample = (sample < -CLIP) ? -CLIP : (sample > CLIP) ? CLIP : sample;
+            const sign = (sample < 0) ? 0x80 : 0;
+            sample = (sample < 0) ? -sample : sample;
             sample += BIAS;
-            let exponent = 0;
-            
-            // Determine exponent (logarithmic segment identification)
-            // We verify bits from MSB down.
-            if (sample > 0x7FFF) exponent = 7;
-            else if (sample >= 0x4000) exponent = 7;
-            else if (sample >= 0x2000) exponent = 6;
-            else if (sample >= 0x1000) exponent = 5;
-            else if (sample >= 0x0800) exponent = 4;
-            else if (sample >= 0x0400) exponent = 3;
-            else if (sample >= 0x0200) exponent = 2;
-            else if (sample >= 0x0100) exponent = 1;
-            else exponent = 0;
+            let exponent = 7;
+            for (let exp = 0; exp < 8; exp++) {
+                if (sample < (1 << (exp + 5))) {
+                    exponent = exp;
+                    break;
+                }
+            }
+            const mantissa = (sample >> (exponent + 3)) & 0x0F;
+            return ~(sign | (exponent << 4) | mantissa) & 0xFF;
+        };
 
-            let mantissa = (sample >> (exponent + 3)) & 0x0F;
-            let mu = ~(sign | (exponent << 4) | mantissa);
-            
-            // Store the compressed byte
-            this.linear2mu[i] = mu & 0xFF;
+        // Fill LUT (Offset by 32768 to handle negative array indices)
+        for (let i = -32768; i <= 32767; i++) {
+            this.linear2mu[i + 32768] = encodeSample(i);
         }
     }
 
-    /**
-     * Decodes a single mu-law byte to 16-bit Linear PCM
-     * Complexity: O(1)
-     */
+    // FIX: Now returns the value, not the array
     decode(muByte) {
-        return this.mu2linear;
+        return this.mu2linear[muByte];
     }
 
-    /**
-     * Encodes a 16-bit Linear PCM sample to mu-law byte
-     * Complexity: O(1)
-     */
     encode(linearSample) {
-        // 1. Shift 16-bit sample to 14-bit range (G.711 standard)
-        // 16-bit (-32768..32767) >> 2 becomes (-8192..8191)
-        let sample = linearSample >> 2; 
-        
-        // 2. Offset the index to be positive for array access (0 = -8192)
-        let lutIndex = sample + 8192;
-        
-        // 3. Clamp bounds to prevent array overflow
-        if (lutIndex < 0) lutIndex = 0;
-        if (lutIndex > 16383) lutIndex = 16383;
-        
-        return this.linear2mu[lutIndex];
+        return this.linear2mu[linearSample + 32768];
     }
 }
 
-// Instantiate the Coder (Singleton)
 const g711 = new MuLawCoder();
 
 // ============================================================================
-// PART 2: ROBUST WAV PARSER (Metadata Noise Removal)
+// PART 2: BACKGROUND LOADER (Network Driven)
 // ============================================================================
+let backgroundBuffer = Buffer.alloc(0);
 
-function parseWavFile(filePath) {
-    console.log(` Loading file: ${filePath}`);
-    const fileBuffer = fs.readFileSync(filePath);
+console.log(`[SYSTEM] Downloading Background Raw Audio...`);
+https.get(BG_URL, (res) => {
+    const data = [];
+    res.on('data', chunk => data.push(chunk));
+    res.on('end', () => {
+        backgroundBuffer = Buffer.concat(data);
+        console.log(`[SYSTEM] Background Loaded! ${backgroundBuffer.length} bytes.`);
+    });
+}).on('error', err => console.error("[ERROR] Failed to download background:", err.message));
 
-    // 1. Validate RIFF Header
-    if (fileBuffer.toString('ascii', 0, 4)!== 'RIFF') {
-        throw new Error('Invalid WAV: Missing RIFF header');
-    }
-    if (fileBuffer.toString('ascii', 8, 12)!== 'WAVE') {
-        throw new Error('Invalid WAV: Missing WAVE format');
-    }
-
-    // 2. Chunk Walker: Iterate through chunks to find 'data'
-    // Start after the 12-byte RIFF header
-    let offset = 12;
-    let audioData = null;
-
-    while (offset < fileBuffer.length) {
-        // Read Chunk ID (4 bytes)
-        const chunkId = fileBuffer.toString('ascii', offset, offset + 4);
-        // Read Chunk Size (4 bytes, Little Endian)
-        const chunkSize = fileBuffer.readUInt32LE(offset + 4);
-        
-        console.log(` Found Chunk: '${chunkId}', Size: ${chunkSize} bytes`);
-
-        if (chunkId === 'fmt ') {
-            // Validate format to ensure it matches our mixing engine requirements
-            const audioFormat = fileBuffer.readUInt16LE(offset + 8);
-            const channels = fileBuffer.readUInt16LE(offset + 10);
-            const sampleRate = fileBuffer.readUInt32LE(offset + 12);
-            const bitsPerSample = fileBuffer.readUInt16LE(offset + 22);
-            
-            console.log(` Fmt Analysis: Format=${audioFormat} (1=PCM), Ch=${channels}, Rate=${sampleRate}, Depth=${bitsPerSample}`);
-            
-            if (audioFormat!== 1) throw new Error('WAV must be Linear PCM (Format 1)');
-            if (channels!== 1) throw new Error('WAV must be Mono (1 Channel)');
-            if (sampleRate!== 8000) throw new Error('WAV must be 8000Hz');
-            if (bitsPerSample!== 16) throw new Error('WAV must be 16-bit');
-        }
-
-        if (chunkId === 'data') {
-            // FOUND IT! The actual audio starts at offset + 8
-            const start = offset + 8;
-            const end = start + chunkSize;
-            // Create a view into the buffer (efficient slicing)
-            audioData = fileBuffer.subarray(start, end);
-            console.log(` Audio Data Extracted: ${audioData.length} bytes`);
-            break; // Stop parsing once data is found
-        }
-
-        // Move to next chunk: Current Offset + ID(4) + Size(4) + ChunkContent(chunkSize)
-        offset += 8 + chunkSize;
-    }
-
-    if (!audioData) {
-        throw new Error('Invalid WAV: No data chunk found in file');
-    }
-
-    return audioData;
-}
-
-// Pre-load audio to memory to avoid I/O latency during calls
-let backgroundBuffer;
-try {
-    backgroundBuffer = parseWavFile(BACKGROUND_FILE_PATH);
-} catch (e) {
-    console.error(` Failed to load background audio: ${e.message}`);
-    process.exit(1);
-}
 
 // ============================================================================
-// PART 3: PACKET-CLOCK STREAM PROCESSOR
+// PART 3: SERVER & MIXER
 // ============================================================================
-
-const server = http.createServer((req, res) => {
-    res.writeHead(200);
-    res.end('Twilio Media Stream Mixer is Running');
-});
-
+const server = http.createServer((req, res) => res.send("Audio Server Online"));
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-    console.log(' New Connection Initiated');
+    console.log('[TWILIO] Stream Connected');
     
-    // Stream State
+    let elevenLabsWs = null;
     let streamSid = null;
-    let backgroundOffset = 0; // Byte cursor for the background file
-    let isStreamOpen = false;
-
-    // Helper: Handle wrapping of background audio (Looping)
-    // Returns a buffer of requested sizeBytes
-    const getBackgroundChunk = (sizeBytes) => {
-        let chunk = Buffer.alloc(sizeBytes);
-        
-        // If the request exceeds remaining file length, we must loop
-        if (backgroundOffset + sizeBytes > backgroundBuffer.length) {
-            const part1Len = backgroundBuffer.length - backgroundOffset;
-            // Copy from cursor to end
-            backgroundBuffer.copy(chunk, 0, backgroundOffset, backgroundBuffer.length);
-            // Copy remaining amount from start (Loop)
-            const part2Len = sizeBytes - part1Len;
-            backgroundBuffer.copy(chunk, part1Len, 0, part2Len);
-            // Reset cursor
-            backgroundOffset = part2Len;
-        } else {
-            // Standard copy
-            backgroundBuffer.copy(chunk, 0, backgroundOffset, backgroundOffset + sizeBytes);
-            backgroundOffset += sizeBytes;
-        }
-        return chunk;
-    };
+    let audioQueue = Buffer.alloc(0); // Queue for AI Audio
+    let bgIndex = 0;
+    let mixerInterval = null;
 
     ws.on('message', (message) => {
-        let msg;
         try {
-            msg = JSON.parse(message);
-        } catch (e) {
-            console.error(' Error parsing JSON:', e);
-            return;
-        }
+            const msg = JSON.parse(message);
 
-        if (msg.event === 'start') {
-            streamSid = msg.start.streamSid;
-            console.log(` Stream Started: ${streamSid}`);
-            isStreamOpen = true;
-            // Reset background track cursor
-            backgroundOffset = 0;
-        } 
-        else if (msg.event === 'media') {
-            if (!isStreamOpen) return;
+            if (msg.event === 'start') {
+                streamSid = msg.start.streamSid;
+                console.log(`[TWILIO] Stream Started: ${streamSid}`);
 
-            // 1. DECODE: Parse inbound payload (Base64 -> Buffer)
-            const inboundPayload = Buffer.from(msg.media.payload, 'base64');
-            
-            // 2. PACKET CLOCK SYNC: 
-            // The size of inboundPayload dictates the timing.
-            // Typically 160 bytes for 20ms of 8kHz u-law.
-            const sampleCount = inboundPayload.length; 
+                // Connect to ElevenLabs
+                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
+                elevenLabsWs = new WebSocket(url, {
+                    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
+                });
 
-            // 3. FETCH BACKGROUND: Get corresponding linear samples
-            // Background is 16-bit (2 bytes per sample). 
-            // So we need 2 * sampleCount bytes.
-            const bgChunkRaw = getBackgroundChunk(sampleCount * 2);
-            
-            // 4. MIXING LOOP
-            // We allocate the output buffer for the same number of samples
-            const mixedPayload = Buffer.alloc(sampleCount); // u-law is 1 byte/sample
+                elevenLabsWs.on('open', () => {
+                    console.log("[11LABS] Connected");
+                    // Start Mixer immediately
+                    if (!mixerInterval) mixerInterval = setInterval(mixAndStream, 20);
+                });
+                
+                elevenLabsWs.on('message', (data) => {
+                    const aiMsg = JSON.parse(data);
+                    if (aiMsg.audio_event?.audio_base64_chunk) {
+                        const newChunk = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
+                        audioQueue = Buffer.concat([audioQueue, newChunk]);
+                    }
+                });
 
-            for (let i = 0; i < sampleCount; i++) {
-                // A. Decode Inbound (u-law byte -> Linear Int16)
-                // Use O(1) LUT
-                const inboundSample = g711.decode(inboundPayload[i]);
+                elevenLabsWs.on('error', (e) => console.error("[11LABS] Error:", e.message));
+                elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
-                // B. Parse Background (Linear Byte Pair -> Linear Int16)
-                // We must read 16-bit Little Endian from the wav bytes
-                const bgSample = bgChunkRaw.readInt16LE(i * 2);
+            } else if (msg.event === 'media') {
+                // --- INPUT LOGIC: Caller -> AI (Clean) ---
+                if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                    // 1. Decode Twilio u-law to Linear
+                    const twilioData = Buffer.from(msg.media.payload, 'base64');
+                    const pcmData = Buffer.alloc(twilioData.length * 2);
 
-                // C. MIX: Simple Addition
-                // This is where constructive interference occurs
-                let mixed = inboundSample + bgSample;
+                    for (let i = 0; i < twilioData.length; i++) {
+                        const linearSample = g711.decode(twilioData[i]);
+                        pcmData.writeInt16LE(linearSample, i * 2);
+                    }
 
-                // D. SOFT CLIP / LIMITING
-                // Prevent Integer Overflow (Wraparound distortion)
-                // A value of 40000 becomes -25536 without clamping.
-                if (mixed > 32767) mixed = 32767;
-                if (mixed < -32768) mixed = -32768;
-
-                // E. ENCODE: Linear Int16 -> u-law byte
-                // Use O(1) LUT
-                mixedPayload[i] = g711.encode(mixed);
-            }
-
-            // 5. TRANSMIT: Send mixed audio back immediately
-            // We are responding to the 'tick' of the inbound packet.
-            const response = {
-                event: 'media',
-                streamSid: streamSid,
-                media: {
-                    payload: mixedPayload.toString('base64')
+                    // 2. Send Linear PCM to ElevenLabs
+                    elevenLabsWs.send(JSON.stringify({ 
+                        user_audio_chunk: pcmData.toString('base64') 
+                    }));
                 }
-            };
-
-            ws.send(JSON.stringify(response));
-        } 
-        else if (msg.event === 'stop') {
-            console.log(` Stream Stopped: ${streamSid}`);
-            isStreamOpen = false;
-        }
-        else if (msg.event === 'mark') {
-            // Marks are used to label specific points in the stream, 
-            // useful for debugging latency or handling barge-in logic.
-            console.log(` Mark received: ${msg.mark.name}`);
-        }
-        else if (msg.event === 'clear') {
-             // Handle Interruption:
-             // If the user spoke and the AI is clearing the buffer, 
-             // we might also want to reset our background music loop or 
-             // jump to a specific timestamp.
-             // For this implementation, we log the event.
-             console.log(` Clear received for ${streamSid}`);
+            } else if (msg.event === 'stop') {
+                console.log(`[TWILIO] Stream Stopped`);
+                if (elevenLabsWs) elevenLabsWs.close();
+                clearInterval(mixerInterval);
+            }
+        } catch (e) {
+            console.error(e);
         }
     });
 
     ws.on('close', () => {
-        console.log(' Client Disconnected');
-        isStreamOpen = false;
+        clearInterval(mixerInterval);
+        console.log('[TWILIO] Client Disconnected');
     });
-    
-    ws.on('error', (error) => {
-        console.error(' Error:', error);
-    });
+
+    // --- THE MIXER LOOP ---
+    // Mixes AI Audio + Background -> Twilio
+    function mixAndStream() {
+        if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
+        
+        const SAMPLES_PER_CHUNK = 160; 
+        const mixedBuffer = Buffer.alloc(SAMPLES_PER_CHUNK); 
+
+        // 1. Get AI Audio Chunk (if available)
+        let aiChunk = null;
+        if (audioQueue.length >= SAMPLES_PER_CHUNK) {
+            aiChunk = audioQueue.subarray(0, SAMPLES_PER_CHUNK);
+            audioQueue = audioQueue.subarray(SAMPLES_PER_CHUNK);
+        }
+
+        for (let i = 0; i < SAMPLES_PER_CHUNK; i++) {
+            let sampleSum = 0;
+
+            // A. Add Background
+            if (backgroundBuffer.length > 0) {
+                if (bgIndex >= backgroundBuffer.length - 2) bgIndex = 0; 
+                const bgSample = backgroundBuffer.readInt16LE(bgIndex);
+                bgIndex += 2;
+                sampleSum += (bgSample * BG_VOLUME);
+            }
+
+            // B. Add AI Voice
+            if (aiChunk) {
+                const aiSample = g711.decode(aiChunk[i]); // Decode u-law AI
+                sampleSum += (aiSample * AI_VOLUME);
+            }
+
+            // C. Hard Clip
+            if (sampleSum > 32767) sampleSum = 32767;
+            if (sampleSum < -32768) sampleSum = -32768;
+
+            // D. Encode to u-law
+            mixedBuffer[i] = g711.encode(Math.floor(sampleSum));
+        }
+
+        ws.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: { payload: mixedBuffer.toString('base64') }
+        }));
+    }
 });
 
-server.listen(HTTP_PORT, () => {
-    console.log(` Listening on port ${HTTP_PORT}`);
-    console.log(` Architecture: Input-Driven Packet Clock`);
-    console.log(` DSP: G.711 LUT-based Transcoding`);
-    console.log(` Ready to mix audio.`);
+server.listen(PORT, () => {
+    console.log(`[SYSTEM] Listening on port ${PORT}`);
 });
