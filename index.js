@@ -11,13 +11,13 @@ const API_KEY = process.env.ELEVENLABS_API_KEY;
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
-// Serve static files (The Music)
+// Serve static files
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
-// --- DSP ENGINE (From Code B: The "Hearing Aid") ---
-// This boosts volume so the AI hears you clearly over the music
+// --- DSP ENGINE (Volume Booster) ---
+// This ensures the user is loud enough for the AI to understand
 const muLawToLinearTable = new Int16Array(256);
-const VOLUME_BOOST = 5.0; // 500% Volume Boost
+const VOLUME_BOOST = 5.0; 
 
 for (let i = 0; i < 256; i++) {
     let muLawByte = ~i;
@@ -34,18 +34,16 @@ for (let i = 0; i < 256; i++) {
 
 // 2. Incoming Call Webhook
 app.post('/incoming-call', (req, res) => {
-    const musicUrl = `https://${req.headers.host}/public/lobby-quiet.mp3`;
     console.log(`\n[CALL START] Incoming from ${req.body.From}`);
 
-    // TwiML Strategy:
-    // 1. <Start>: Forks audio to AI. REMOVED "track" attribute to allow bidirectional audio.
-    // 2. <Play>: Plays music in the foreground.
+    // CRITICAL FIX: We switch from <Start> (Background) to <Connect> (Foreground).
+    // This gives the AI full control of the audio, ensuring it can be heard.
+    // The <Play> music is removed because it blocks the AI.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Start>
+        <Connect>
             <Stream url="wss://${req.headers.host}/media-stream" />
-        </Start>
-        <Play loop="0">${musicUrl}</Play>
+        </Connect>
     </Response>`;
 
     res.type('text/xml').send(twiml);
@@ -61,7 +59,7 @@ wss.on('connection', (ws) => {
     let streamSid = null;
     let elevenLabsWs = null;
 
-    // Buffers from Code B
+    // Buffers
     let audioQueue = Buffer.alloc(0);
     let isPlaying = false;
     let outputIntervalId = null;
@@ -88,7 +86,7 @@ wss.on('connection', (ws) => {
             const msg = JSON.parse(data.toString());
             let chunkData = null;
 
-            // Robust Key Search (From Code B)
+            // Key Search Strategy
             if (msg.audio_event) {
                 if (msg.audio_event.audio_base_64) chunkData = msg.audio_event.audio_base_64;
                 else if (msg.audio_event.audio_base64_chunk) chunkData = msg.audio_event.audio_base64_chunk;
@@ -99,8 +97,7 @@ wss.on('connection', (ws) => {
                 const newChunk = Buffer.from(chunkData, 'base64');
                 audioQueue = Buffer.concat([audioQueue, newChunk]);
 
-                // The Pacer: Wait for 0.1s of audio, then play
-                if (!isPlaying && audioQueue.length >= 800) {
+                if (!isPlaying && audioQueue.length >= 4800) { // Buffer ~0.6s to prevent stutter
                     isPlaying = true;
                     outputIntervalId = setInterval(streamAudioToTwilio, 20);
                 }
@@ -118,7 +115,7 @@ wss.on('connection', (ws) => {
                 console.log(`[Twilio] Stream Started: ${streamSid}`);
             } else if (msg.event === 'media') {
                 if (elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // DSP: Upsample 8k -> 16k + Volume Boost (From Code B)
+                    // DSP: Upsample 8k -> 16k + Volume Boost
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4);
 
@@ -132,7 +129,7 @@ wss.on('connection', (ws) => {
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
 
-                    // Buffer 50ms of audio before sending to AI
+                    // Send to AI
                     if (pcmInputQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({
                             user_audio_chunk: pcmInputQueue.toString('base64')
