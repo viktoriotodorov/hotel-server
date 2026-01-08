@@ -1,34 +1,24 @@
-// index.js (Final Cloud: Turbo Low-Latency Mode)
+// index.js (Final Hybrid: Turbo Upsampler + Background Music)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
-
-const PORT = process.env.PORT || 3000;
+const path = require('path');
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-
-app.get('/', (req, res) => res.send("Server Online: Turbo Mode Active"));
-
-app.post('/incoming-call', (req, res) => {
-    const callerId = req.body.From || "Unknown";
-    console.log(`[TWILIO] Call from: ${callerId}`);
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-      <Response>
-        <Connect>
-          <Stream url="wss://${req.headers.host}/media-stream" />
-        </Connect>
-      </Response>`;
-    res.type('text/xml').send(twiml);
-});
-
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// --- MU-LAW LOOKUP TABLE WITH VOLUME BOOST ---
-const muLawToLinearTable = new Int16Array(256);
-const VOLUME_BOOST = 5.0; // Keep the volume loud
+// ==================== CONFIGURATION ====================
+const PORT = process.env.PORT || 3000;
+const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
+const API_KEY = process.env.ELEVENLABS_API_KEY;
 
+// ==================== DSP ENGINE (The Upsampler) ====================
+// This converts Twilio's low-res 8kHz audio into crispy 16kHz audio
+const muLawToLinearTable = new Int16Array(256);
+const VOLUME_BOOST = 5.0; 
+
+// Generate Lookup Table
 for (let i = 0; i < 256; i++) {
     let muLawByte = ~i; 
     let sign = (muLawByte & 0x80) >> 7;
@@ -42,11 +32,39 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sample;
 }
 
+// Middleware
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ==================== 1. INCOMING CALL ROUTE ====================
+app.post('/incoming-call', (req, res) => {
+    const host = req.headers.host;
+    // Ensure your lobby-quiet.mp3 is in the 'public' folder!
+    const musicUrl = `https://${host}/lobby-quiet.mp3`; 
+
+    console.log(`[TWILIO] Call incoming from: ${req.body.From}`);
+
+    // MAGIC: We use <Start> instead of <Connect>.
+    // This allows <Play> (Music) to run at the same time.
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      <Response>
+        <Start>
+          <Stream url="wss://${host}/media-stream" track="inbound_track" />
+        </Start>
+        <Play loop="0">${musicUrl}</Play>
+      </Response>`;
+
+    res.type('text/xml').send(twiml);
+});
+
+// ==================== 2. WEBSOCKET ROUTE ====================
 wss.on('connection', (ws) => {
-    console.log("[TWILIO] Client Connected");
+    console.log("[TWILIO] Stream Connected");
     
     let elevenLabsWs = null;
     let streamSid = null;
+    
+    // Your Custom Buffers (Preserved for Turbo Speed)
     let audioQueue = Buffer.alloc(0); 
     let isPlaying = false;
     let outputIntervalId = null;
@@ -56,45 +74,34 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const msg = JSON.parse(message);
-
+            
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log(`[TWILIO] Stream Started!`);
-
-                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
+                console.log(`[TWILIO] Stream Started: ${streamSid}`);
+                
+                // Connect to ElevenLabs
+                // Note: We use ulaw_8000 for OUTPUT (Phone line limit)
+                const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
                 elevenLabsWs = new WebSocket(url, {
-                    headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }
+                    headers: { 'xi-api-key': API_KEY }
                 });
 
                 elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
                 
+                // HANDLE AUDIO FROM AI -> TWILIO
                 elevenLabsWs.on('message', (data) => {
                     const aiMsg = JSON.parse(data);
                     
                     let chunkData = null;
-                    if (aiMsg.audio_event) {
-                        if (aiMsg.audio_event.audio_base64_chunk) {
-                            chunkData = aiMsg.audio_event.audio_base64_chunk;
-                        } else if (aiMsg.audio_event.audio) {
-                            chunkData = aiMsg.audio_event.audio;
-                        } else {
-                            const keys = Object.keys(aiMsg.audio_event);
-                            for (const key of keys) {
-                                const val = aiMsg.audio_event[key];
-                                if (typeof val === 'string' && val.length > 100) {
-                                    chunkData = val;
-                                    break;
-                                }
-                            }
-                        }
+                    if (aiMsg.audio_event?.audio_base64_chunk) {
+                        chunkData = aiMsg.audio_event.audio_base64_chunk;
                     }
-
+                    
                     if (chunkData) {
                         const newChunk = Buffer.from(chunkData, 'base64');
                         audioQueue = Buffer.concat([audioQueue, newChunk]);
-
-                        // TURBO CHANGE: Play almost immediately (wait for just 0.1s instead of 0.5s)
-                        // 800 bytes = 0.1 seconds of audio
+                        
+                        // Your Turbo Logic: Play after 0.1s buffer
                         if (!isPlaying && audioQueue.length >= 800) { 
                             isPlaying = true;
                             outputIntervalId = setInterval(streamAudioToTwilio, 20);
@@ -106,22 +113,25 @@ wss.on('connection', (ws) => {
                 elevenLabsWs.on('close', () => console.log("[11LABS] Disconnected"));
 
             } else if (msg.event === 'media') {
+                // HANDLE AUDIO FROM USER -> AI
+                // We use your DSP logic to Upsample 8kHz -> 16kHz
                 if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
                     const twilioChunk = Buffer.from(msg.media.payload, 'base64');
                     const pcmChunk = Buffer.alloc(twilioChunk.length * 4); 
 
                     for (let i = 0; i < twilioChunk.length; i++) {
                         const currentSample = muLawToLinearTable[twilioChunk[i]];
+                        // Interpolation (The "Crispy" Math)
                         const midPoint = Math.floor((lastInputSample + currentSample) / 2);
+                        
                         pcmChunk.writeInt16LE(midPoint, i * 4);
                         pcmChunk.writeInt16LE(currentSample, i * 4 + 2);
                         lastInputSample = currentSample;
                     }
 
                     pcmInputQueue = Buffer.concat([pcmInputQueue, pcmChunk]);
-
-                    // TURBO CHANGE: Send faster (every 50ms instead of 100ms)
-                    // 1600 bytes = 50ms of 16kHz audio
+                    
+                    // Send every 50ms (Turbo Speed)
                     if (pcmInputQueue.length >= 1600) {
                         elevenLabsWs.send(JSON.stringify({ 
                             user_audio_chunk: pcmInputQueue.toString('base64') 
@@ -130,6 +140,7 @@ wss.on('connection', (ws) => {
                     }
                 }
             } else if (msg.event === 'stop') {
+                console.log("[TWILIO] Call Ended");
                 if (elevenLabsWs) elevenLabsWs.close();
                 clearInterval(outputIntervalId);
             }
@@ -140,12 +151,16 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => clearInterval(outputIntervalId));
 
+    // Your Custom Streamer Function
     function streamAudioToTwilio() {
         if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
+        
+        // Send small chunks (20ms) for low latency
         const CHUNK_SIZE = 160; 
         if (audioQueue.length >= CHUNK_SIZE) {
             const chunkToSend = audioQueue.subarray(0, CHUNK_SIZE);
             audioQueue = audioQueue.subarray(CHUNK_SIZE);
+            
             ws.send(JSON.stringify({
                 event: 'media',
                 streamSid: streamSid,
