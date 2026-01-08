@@ -1,8 +1,4 @@
-// index.js
-
-// 1. REMOVE DOTENV (We rely 100% on Render's Dashboard Variables)
-// require('dotenv').config(); <--- DELETED
-
+// index.js (Final Fix: Bidirectional Audio)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -17,31 +13,68 @@ const PORT = process.env.PORT || 3000;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// =========================================================================
-// SYSTEM DIAGNOSTIC (Run this once on startup)
-// =========================================================================
-console.log("///////////////////////////////////////////////////////////");
-console.log("SYSTEM STARTUP CHECK");
-console.log(`PORT: ${PORT}`);
-console.log(`AGENT_ID: ${AGENT_ID ? "LOADED OK (" + AGENT_ID.substring(0,4) + "...)" : "❌ MISSING/UNDEFINED"}`);
-console.log(`API_KEY: ${ELEVENLABS_API_KEY ? "LOADED OK (Masked)" : "❌ MISSING/UNDEFINED"}`);
-console.log("///////////////////////////////////////////////////////////");
+// Audio Settings
+const MIC_BOOST = 5.0; // Boosts your voice so AI hears you over the music
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 1. INCOMING CALL ROUTE
+// ==================== DSP HELPERS (The Hearing Aid) ====================
+const muLawToLinearTable = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+    let mu = ~i;
+    let sign = (mu & 0x80) >> 7;
+    let exponent = (mu & 0x70) >> 4;
+    let mantissa = mu & 0x0F;
+    let sample = (mantissa * 2 + 33) * (1 << exponent) - 33;
+    muLawToLinearTable[i] = sign === 0 ? -sample : sample;
+}
+
+function muLawToLinear(buffer) {
+    const pcm = new Int16Array(buffer.length);
+    for (let i = 0; i < buffer.length; i++) {
+        pcm[i] = muLawToLinearTable[buffer[i]];
+    }
+    return pcm;
+}
+
+function upsample8kTo16k(pcm8k) {
+    const length = pcm8k.length;
+    const pcm16k = new Int16Array(length * 2);
+    for (let i = 0; i < length; i++) {
+        pcm16k[i * 2] = pcm8k[i];
+        pcm16k[i * 2 + 1] = pcm8k[i];
+    }
+    return pcm16k;
+}
+
+function boostAudio(pcmSamples) {
+    const length = pcmSamples.length;
+    const boosted = new Int16Array(length);
+    for (let i = 0; i < length; i++) {
+        let sample = pcmSamples[i] * MIC_BOOST;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        boosted[i] = sample;
+    }
+    return boosted;
+}
+
+// ==================== 1. INCOMING CALL ROUTE ====================
 app.post('/incoming-call', (req, res) => {
     const host = req.headers.host;
     const musicUrl = `https://${host}/lobby-quiet.mp3`;
 
     console.log(`[Twilio] Call incoming from ${req.body.From}`);
 
+    // *** THE FIX IS HERE ***
+    // Removed: track="inbound_track"
+    // Now the stream is Bidirectional (User can talk, AI can talk back)
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
-            <Stream url="wss://${host}/media-stream" track="inbound_track" />
+            <Stream url="wss://${host}/media-stream" />
         </Start>
         <Play loop="0">${musicUrl}</Play>
     </Response>`;
@@ -50,14 +83,14 @@ app.post('/incoming-call', (req, res) => {
     res.send(twiml);
 });
 
-// 2. WEBSOCKET ROUTE
+// ==================== 2. WEBSOCKET ROUTE ====================
 wss.on('connection', (ws) => {
-    console.log('[Connection] Twilio Stream connected');
+    console.log('[Connection] Stream connected');
     let streamSid = null;
     let elevenLabsWs = null;
+    let audioQueue = [];
 
-    // Connect to ElevenLabs 
-    // We use "ulaw_8000" to match the phone line
+    // Connect to ElevenLabs (u-law 8k output matches Phone)
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -70,17 +103,8 @@ wss.on('connection', (ws) => {
     }
 
     elevenLabsWs.on('open', () => console.log('[11Labs] Connected to AI Agent'));
-    
-    // Debug: Log if the connection closes unexpectedly
-    elevenLabsWs.on('close', (code, reason) => {
-        console.log(`[11Labs] Disconnected. Code: ${code}, Reason: ${reason}`);
-    });
 
-    elevenLabsWs.on('error', (error) => {
-        console.error(`[11Labs] Socket Error: ${error.message}`);
-    });
-
-    // HANDLE MESSAGES FROM ELEVENLABS (AI SPEAKING)
+    // FROM AI -> TO USER (Now this will actually work!)
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
@@ -90,8 +114,11 @@ wss.on('connection', (ws) => {
                     streamSid: streamSid,
                     media: { payload: msg.audio_event.audio_base64_chunk }
                 };
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(payload));
+                
+                if (streamSid) {
+                    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+                } else {
+                    audioQueue.push(payload);
                 }
             }
         } catch (error) {
@@ -99,7 +126,10 @@ wss.on('connection', (ws) => {
         }
     });
 
-    // HANDLE MESSAGES FROM TWILIO (USER SPEAKING)
+    elevenLabsWs.on('close', (code, reason) => console.log(`[11Labs] Disconnected: ${code} ${reason}`));
+    elevenLabsWs.on('error', (error) => console.error(`[11Labs] Error: ${error.message}`));
+
+    // FROM USER -> TO AI (Boosted)
     ws.on('message', (msg) => {
         try {
             const data = JSON.parse(msg);
@@ -108,15 +138,30 @@ wss.on('connection', (ws) => {
                 case 'start':
                     streamSid = data.start.streamSid;
                     console.log(`[Twilio] Stream started: ${streamSid}`);
+                    // Flush buffer
+                    if (audioQueue.length > 0) {
+                        audioQueue.forEach(p => { p.streamSid = streamSid; ws.send(JSON.stringify(p)); });
+                        audioQueue = [];
+                    }
                     break;
 
                 case 'media':
-                    // *** RESTORED FROM YOUR OLD WORKING CODE ***
-                    // We use the EXACT format you had before.
                     if (elevenLabsWs.readyState === WebSocket.OPEN) {
+                        // 1. Decode (Phone Format -> PCM)
+                        const rawMuLaw = Buffer.from(data.media.payload, 'base64');
+                        const pcm8k = muLawToLinear(rawMuLaw);
+                        
+                        // 2. Boost (Make it 5x louder so AI ignores the quiet music)
+                        const boostedPcm = boostAudio(pcm8k);
+                        
+                        // 3. Upsample (Make it High Quality for AI)
+                        const pcm16k = upsample8kTo16k(boostedPcm);
+
+                        // 4. Send to AI
+                        const pcmBuffer = Buffer.from(pcm16k.buffer);
                         const aiMsg = {
                             type: 'user_audio_chunk',
-                            audio_base64_chunk: data.media.payload
+                            audio_base64_chunk: pcmBuffer.toString('base64')
                         };
                         elevenLabsWs.send(JSON.stringify(aiMsg));
                     }
