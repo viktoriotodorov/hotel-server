@@ -1,5 +1,5 @@
-// index.js (Pure Passthrough - Protocol Compliant)
-require('dotenv').config();
+// index.js (Production Mode: No .env file, Debug Logging)
+// require('dotenv').config(); <--- REMOVED. We trust Render variables only.
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -11,8 +11,27 @@ const wss = new WebSocket.Server({ server });
 
 // Environment Variables
 const PORT = process.env.PORT || 3000;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
+
+// CRITICAL: We check multiple possible names for the ID to be safe
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY;
+const AGENT_ID = process.env.ELEVENLABS_AGENT_ID || process.env.AGENT_ID;
+
+// ==================== SYSTEM CHECK (DEBUG) ====================
+// This runs once when the server starts to tell us what is loaded.
+console.log("--- SYSTEM CHECK ---");
+if (!ELEVENLABS_API_KEY) {
+    console.error("❌ CRITICAL ERROR: API Key is MISSING. Check Render Environment Variables.");
+} else {
+    console.log("✅ API Key loaded.");
+}
+
+if (!AGENT_ID) {
+    console.error("❌ CRITICAL ERROR: Agent ID is MISSING. Check Render Environment Variables.");
+} else {
+    console.log(`✅ Agent ID loaded: ${AGENT_ID.substring(0, 4)}... (Hidden)`);
+}
+console.log("--------------------");
+// =============================================================
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
@@ -43,8 +62,13 @@ wss.on('connection', (ws) => {
     let streamSid = null;
     let elevenLabsWs = null;
 
-    // Connect to ElevenLabs 
-    // CRITICAL: We request ulaw_8000. We MUST send ulaw_8000.
+    if (!AGENT_ID || !ELEVENLABS_API_KEY) {
+        console.error("[Error] Missing Credentials. Cannot connect to AI.");
+        ws.close();
+        return;
+    }
+
+    // Connect to ElevenLabs (Format: ulaw_8000)
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -58,7 +82,7 @@ wss.on('connection', (ws) => {
 
     elevenLabsWs.on('open', () => console.log('[11Labs] Connected to AI Agent'));
 
-    // Handle AI Speaking (Server -> Twilio)
+    // Handle AI Speaking
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
@@ -68,20 +92,18 @@ wss.on('connection', (ws) => {
                     streamSid: streamSid,
                     media: { payload: msg.audio_event.audio_base64_chunk }
                 };
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify(payload));
-                }
+                if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
             }
         } catch (error) {
             console.log('[11Labs] Parse Error:', error);
         }
     });
 
-    // Handle Error / Close
+    // Handle Errors
     elevenLabsWs.on('error', (err) => console.error('[11Labs] Error:', err.message));
     elevenLabsWs.on('close', (code, reason) => console.log(`[11Labs] Closed: ${code} ${reason}`));
 
-    // Handle User Speaking (Twilio -> Server -> ElevenLabs)
+    // Handle User Speaking (Passthrough)
     ws.on('message', (msg) => {
         try {
             const data = JSON.parse(msg);
@@ -93,20 +115,15 @@ wss.on('connection', (ws) => {
                     break;
 
                 case 'media':
-                    // PASSTHROUGH MODE:
-                    // Twilio sends 8k Mu-Law. ElevenLabs expects 8k Mu-Law.
-                    // We send the payload EXACTLY as we received it.
                     if (elevenLabsWs.readyState === WebSocket.OPEN) {
                         const audioMessage = {
-                            type: 'user_audio_chunk',
-                            audio_base64_chunk: data.media.payload
+                            user_audio_chunk: data.media.payload
                         };
                         elevenLabsWs.send(JSON.stringify(audioMessage));
                     }
                     break;
 
                 case 'stop':
-                    console.log('[Twilio] Call ended');
                     if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
                     break;
             }
@@ -116,7 +133,6 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log('[Connection] Closed');
         if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
     });
 });
