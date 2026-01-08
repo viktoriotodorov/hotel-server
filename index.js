@@ -14,23 +14,17 @@ const PORT = process.env.PORT || 3000;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// Middleware to parse form data from Twilio
+// Middleware
 app.use(express.urlencoded({ extended: true }));
-
-// Serve the static "public" folder (where the MP3 lives)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // 1. INCOMING CALL ROUTE
 app.post('/incoming-call', (req, res) => {
-    // Construct the full URL to the MP3 file hosted on this server
     const host = req.headers.host;
     const musicUrl = `https://${host}/lobby-quiet.mp3`;
 
     console.log(`[Twilio] Call incoming from ${req.body.From}`);
 
-    // TwiML Logic:
-    // <Start>: Forks audio to the WebSocket (AI). track="inbound_track" = AI hears USER only.
-    // <Play>: Plays the MP3 in the foreground (User hears Music + AI).
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
@@ -43,14 +37,13 @@ app.post('/incoming-call', (req, res) => {
     res.send(twiml);
 });
 
-// 2. WEBSOCKET ROUTE (The AI Brain)
+// 2. WEBSOCKET ROUTE
 wss.on('connection', (ws) => {
     console.log('[Connection] Twilio Stream connected');
     let streamSid = null;
     let elevenLabsWs = null;
 
-    // Connect to ElevenLabs Conversational AI
-    // We use "ulaw_8000" because that is the raw format of the phone line
+    // Connect to ElevenLabs
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -62,15 +55,13 @@ wss.on('connection', (ws) => {
         return;
     }
 
-    // Handle Open Event
     elevenLabsWs.on('open', () => console.log('[11Labs] Connected to AI Agent'));
 
-    // Handle Audio FROM ElevenLabs -> TO Twilio
+    // HANDLE MESSAGES FROM ELEVENLABS (AI SPEAKING)
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
             if (msg.audio_event?.audio_base64_chunk) {
-                // Wrap the audio in Twilio's specific JSON format
                 const payload = {
                     event: 'media',
                     streamSid: streamSid,
@@ -85,7 +76,7 @@ wss.on('connection', (ws) => {
         }
     });
 
-    // Handle Audio FROM Twilio -> TO ElevenLabs
+    // HANDLE MESSAGES FROM TWILIO (USER SPEAKING)
     ws.on('message', (msg) => {
         try {
             const data = JSON.parse(msg);
@@ -95,8 +86,10 @@ wss.on('connection', (ws) => {
                     streamSid = data.start.streamSid;
                     console.log(`[Twilio] Stream started: ${streamSid}`);
                     break;
+
                 case 'media':
-                    // Send user audio to ElevenLabs
+                    // *** FIX IMPLEMENTED HERE ***
+                    // We are using the EXACT payload structure from your old working code.
                     if (elevenLabsWs.readyState === WebSocket.OPEN) {
                         const aiMsg = {
                             type: 'user_audio_chunk',
@@ -105,6 +98,7 @@ wss.on('connection', (ws) => {
                         elevenLabsWs.send(JSON.stringify(aiMsg));
                     }
                     break;
+
                 case 'stop':
                     console.log('[Twilio] Call ended');
                     if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
@@ -115,7 +109,6 @@ wss.on('connection', (ws) => {
         }
     });
 
-    // Cleanup
     ws.on('close', () => {
         console.log('[Connection] Closed');
         if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
