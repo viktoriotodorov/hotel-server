@@ -1,4 +1,4 @@
-// index.js (Final Fix: Bidirectional Audio)
+// index.js (Output Booster Edition)
 const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
@@ -14,14 +14,20 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
 // Audio Settings
-const MIC_BOOST = 5.0; // Boosts your voice so AI hears you over the music
+const AI_BOOST = 3.0; // Multiplies AI Volume by 3x
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ==================== DSP HELPERS (The Hearing Aid) ====================
+// ==================== DSP ENGINE (Output Booster) ====================
+// Tables for G.711 (Mu-Law) conversion
 const muLawToLinearTable = new Int16Array(256);
+const linearToMuLawTable = new Uint8Array(65536);
+const BIAS = 0x84;
+const CLIP = 32635;
+
+// Generate Decode Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -31,46 +37,54 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -sample : sample;
 }
 
-function muLawToLinear(buffer) {
-    const pcm = new Int16Array(buffer.length);
-    for (let i = 0; i < buffer.length; i++) {
-        pcm[i] = muLawToLinearTable[buffer[i]];
+// Generate Encode Table
+for (let i = 0; i < 65536; i++) {
+    let sample = i - 32768;
+    let sign = (sample < 0) ? 0x80 : 0;
+    if (sample < 0) sample = -sample;
+    if (sample > CLIP) sample = CLIP;
+    sample += BIAS;
+    let exponent = 7;
+    for (let exp = 0; exp < 8; exp++) {
+        if (sample < (1 << (exp + 5))) { exponent = exp; break; }
     }
-    return pcm;
+    let mantissa = (sample >> (exponent + 3)) & 0x0F;
+    linearToMuLawTable[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 
-function upsample8kTo16k(pcm8k) {
-    const length = pcm8k.length;
-    const pcm16k = new Int16Array(length * 2);
+// Function: Boost Volume of Mu-Law Audio
+function boostOutput(buffer) {
+    const length = buffer.length;
+    const processed = new Uint8Array(length);
+    
     for (let i = 0; i < length; i++) {
-        pcm16k[i * 2] = pcm8k[i];
-        pcm16k[i * 2 + 1] = pcm8k[i];
+        // 1. Decode
+        let pcm = muLawToLinearTable[buffer[i]];
+        
+        // 2. Boost
+        pcm = pcm * AI_BOOST;
+        
+        // 3. Clamp
+        if (pcm > 32767) pcm = 32767;
+        if (pcm < -32768) pcm = -32768;
+        
+        // 4. Encode
+        let index = pcm + 32768;
+        if (index < 0) index = 0; 
+        if (index > 65535) index = 65535;
+        processed[i] = linearToMuLawTable[index];
     }
-    return pcm16k;
+    return processed;
 }
 
-function boostAudio(pcmSamples) {
-    const length = pcmSamples.length;
-    const boosted = new Int16Array(length);
-    for (let i = 0; i < length; i++) {
-        let sample = pcmSamples[i] * MIC_BOOST;
-        if (sample > 32767) sample = 32767;
-        if (sample < -32768) sample = -32768;
-        boosted[i] = sample;
-    }
-    return boosted;
-}
-
-// ==================== 1. INCOMING CALL ROUTE ====================
+// ==================== 1. INCOMING CALL ====================
 app.post('/incoming-call', (req, res) => {
     const host = req.headers.host;
     const musicUrl = `https://${host}/lobby-quiet.mp3`;
 
     console.log(`[Twilio] Call incoming from ${req.body.From}`);
 
-    // *** THE FIX IS HERE ***
-    // Removed: track="inbound_track"
-    // Now the stream is Bidirectional (User can talk, AI can talk back)
+    // CHANGE: Removed track="inbound_track" so audio can travel BOTH ways.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
@@ -83,14 +97,12 @@ app.post('/incoming-call', (req, res) => {
     res.send(twiml);
 });
 
-// ==================== 2. WEBSOCKET ROUTE ====================
+// ==================== 2. WEBSOCKET BRIDGE ====================
 wss.on('connection', (ws) => {
     console.log('[Connection] Stream connected');
     let streamSid = null;
     let elevenLabsWs = null;
-    let audioQueue = [];
 
-    // Connect to ElevenLabs (u-law 8k output matches Phone)
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -102,23 +114,28 @@ wss.on('connection', (ws) => {
         return;
     }
 
-    elevenLabsWs.on('open', () => console.log('[11Labs] Connected to AI Agent'));
+    elevenLabsWs.on('open', () => console.log('[11Labs] Connected'));
 
-    // FROM AI -> TO USER (Now this will actually work!)
+    // AI SPEAKING -> BOOST -> PHONE
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data);
             if (msg.audio_event?.audio_base64_chunk) {
+                // 1. Get Audio from AI
+                const rawAudio = Buffer.from(msg.audio_event.audio_base64_chunk, 'base64');
+                
+                // 2. BOOST IT!
+                const boostedAudio = boostOutput(rawAudio);
+
+                // 3. Send to Twilio
                 const payload = {
                     event: 'media',
                     streamSid: streamSid,
-                    media: { payload: msg.audio_event.audio_base64_chunk }
+                    media: { payload: Buffer.from(boostedAudio).toString('base64') }
                 };
                 
-                if (streamSid) {
-                    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
-                } else {
-                    audioQueue.push(payload);
+                if (streamSid && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify(payload));
                 }
             }
         } catch (error) {
@@ -126,10 +143,7 @@ wss.on('connection', (ws) => {
         }
     });
 
-    elevenLabsWs.on('close', (code, reason) => console.log(`[11Labs] Disconnected: ${code} ${reason}`));
-    elevenLabsWs.on('error', (error) => console.error(`[11Labs] Error: ${error.message}`));
-
-    // FROM USER -> TO AI (Boosted)
+    // USER SPEAKING -> AI (Passthrough - No processing needed per your finding)
     ws.on('message', (msg) => {
         try {
             const data = JSON.parse(msg);
@@ -138,37 +152,18 @@ wss.on('connection', (ws) => {
                 case 'start':
                     streamSid = data.start.streamSid;
                     console.log(`[Twilio] Stream started: ${streamSid}`);
-                    // Flush buffer
-                    if (audioQueue.length > 0) {
-                        audioQueue.forEach(p => { p.streamSid = streamSid; ws.send(JSON.stringify(p)); });
-                        audioQueue = [];
-                    }
                     break;
 
                 case 'media':
                     if (elevenLabsWs.readyState === WebSocket.OPEN) {
-                        // 1. Decode (Phone Format -> PCM)
-                        const rawMuLaw = Buffer.from(data.media.payload, 'base64');
-                        const pcm8k = muLawToLinear(rawMuLaw);
-                        
-                        // 2. Boost (Make it 5x louder so AI ignores the quiet music)
-                        const boostedPcm = boostAudio(pcm8k);
-                        
-                        // 3. Upsample (Make it High Quality for AI)
-                        const pcm16k = upsample8kTo16k(boostedPcm);
-
-                        // 4. Send to AI
-                        const pcmBuffer = Buffer.from(pcm16k.buffer);
                         const aiMsg = {
-                            type: 'user_audio_chunk',
-                            audio_base64_chunk: pcmBuffer.toString('base64')
+                            user_audio_chunk: data.media.payload
                         };
                         elevenLabsWs.send(JSON.stringify(aiMsg));
                     }
                     break;
 
                 case 'stop':
-                    console.log('[Twilio] Call ended');
                     if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
                     break;
             }
