@@ -36,6 +36,11 @@ wss.on('connection', (ws) => {
     let streamSid = null;
     let elevenLabsWs = null;
 
+    // --- THE PACER BUFFERS ---
+    // We use a raw Buffer to hold the audio bytes safely
+    let audioBuffer = Buffer.alloc(0);
+    let packetInterval = null;
+
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -49,22 +54,48 @@ wss.on('connection', (ws) => {
 
     elevenLabsWs.on('open', () => console.log("[11Labs] Socket OPEN"));
 
-    // --- AI -> PHONE (With "The Chunker") ---
+    // --- AI -> PHONE (With The Pacer) ---
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
 
             if (msg.audio_event) {
-                // Get the base64 string
+                // Check both keys (just to be safe)
                 const base64Audio = msg.audio_event.audio_base_64 || msg.audio_event.audio_base64_chunk;
                 
-                if (base64Audio && streamSid) {
-                    // Send to the chunker function
-                    streamToTwilio(ws, streamSid, base64Audio);
+                if (base64Audio) {
+                    // 1. Convert Base64 to Raw Bytes
+                    const newAudio = Buffer.from(base64Audio, 'base64');
+                    
+                    // 2. Add to our Global Buffer (Don't send yet!)
+                    audioBuffer = Buffer.concat([audioBuffer, newAudio]);
+                    // console.log(`[Buffer] Added ${newAudio.length} bytes. Total: ${audioBuffer.length}`);
                 }
             }
         } catch (e) { console.log('[Parsing Error]', e); }
     });
+
+    // --- THE HEARTBEAT (Sends audio every 20ms) ---
+    // Twilio expects 160 bytes of audio every 20 milliseconds (8000Hz u-law).
+    packetInterval = setInterval(() => {
+        if (!streamSid || ws.readyState !== WebSocket.OPEN) return;
+
+        const CHUNK_SIZE = 160; // 20ms of audio
+
+        // If we have enough data for a packet, send it
+        if (audioBuffer.length >= CHUNK_SIZE) {
+            // Slice the first 160 bytes
+            const chunk = audioBuffer.slice(0, CHUNK_SIZE);
+            audioBuffer = audioBuffer.slice(CHUNK_SIZE);
+
+            // Send to Twilio
+            ws.send(JSON.stringify({
+                event: 'media',
+                streamSid: streamSid,
+                media: { payload: chunk.toString('base64') }
+            }));
+        }
+    }, 20); // Run this every 20ms
 
     // --- PHONE -> AI ---
     ws.on('message', (message) => {
@@ -82,31 +113,10 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
+        // Stop the heartbeat when call ends
+        clearInterval(packetInterval);
         if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
     });
 });
-
-// --- HELPER: Cut the big audio blob into small sips ---
-function streamToTwilio(ws, streamSid, base64Audio) {
-    // 1. Calculate safe chunk size (Twilio likes 160 bytes = 20ms of audio)
-    // Base64 is 4 chars for 3 bytes. So ~220 chars is roughly 160 bytes.
-    // We can go slightly larger for safety, e.g., 500 chars per message.
-    const CHUNK_SIZE = 500; 
-    
-    let index = 0;
-    
-    // 2. Loop through the giant string and send it in pieces
-    while (index < base64Audio.length) {
-        const chunk = base64Audio.slice(index, index + CHUNK_SIZE);
-        index += CHUNK_SIZE;
-
-        // 3. Send the small sip to Twilio
-        ws.send(JSON.stringify({
-            event: 'media',
-            streamSid: streamSid,
-            media: { payload: chunk }
-        }));
-    }
-}
 
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
