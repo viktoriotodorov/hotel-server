@@ -12,50 +12,38 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER; 
 
+// Initialize Twilio
 const client = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.use('/public', express.static(path.join(__dirname, 'public')));
 
 // =========================================================================
-// ROUTE 1: THE MASTER HANDLER (The Traffic Controller)
+// ROUTE 1: INCOMING CALL (The Human)
 // =========================================================================
 app.post('/incoming-call', async (req, res) => {
     const callSid = req.body.CallSid;
-    const caller = req.body.From;
+    const roomName = `Room_${callSid}`;
     const host = req.headers.host;
 
-    console.log(`[INCOMING] Call from ${caller}`);
+    console.log(`[INCOMING] Human joining: ${roomName}`);
 
-    // --- LOGIC A: THE MUSIC BOT ---
-    // We identify the Music Bot because it calls FROM our number TO our number
-    if (caller === TWILIO_PHONE_NUMBER) {
-        console.log("   -> It's the Music Bot. Playing MP3.");
-        const musicUrl = `https://${host}/public/lobby-quiet.mp3`;
-        
-        // The Bot plays music forever. 
-        // Since this Bot is bridged into the Conference, everyone hears it.
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Play loop="0">${musicUrl}</Play>
-        </Response>`;
-        return res.type('text/xml').send(twiml);
+    // 1. INJECT THE AI (The Ghost Leg)
+    // We try to add the AI. If your keys are wrong, this will log an error.
+    try {
+        await client.calls.create({
+            to: 'client:AI_BOT', // Internal routing name
+            from: TWILIO_PHONE_NUMBER,
+            url: `https://${host}/join-ai-leg?room=${roomName}`
+        });
+        console.log("[INJECT] AI Bot dispatched.");
+    } catch (e) { 
+        console.error("[ERROR] AI Bot Injection Failed:", e.message); 
     }
 
-    // --- LOGIC B: THE HUMAN GUEST ---
-    const roomName = `Room_${callSid}`;
-    console.log(`   -> It's a Human. Creating Room: ${roomName}`);
-
-    // 1. Inject the AI Bot (Async)
-    injectAIBot(host, roomName);
-
-    // 2. Inject the Music Bot (Async)
-    injectMusicBot(host, roomName);
-
-    // 3. Put the Human in the Conference
-    // CRITICAL FIX: Removed 'waitUrl' to prevent the 404 POST crash.
-    // The Music Bot will provide the audio instead.
+    // 2. PLACE HUMAN IN CONFERENCE
+    // We REMOVED 'waitUrl' to stop the 404 Crash.
+    // You will hear silence (or default music) until the AI joins.
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Dial>
@@ -67,50 +55,18 @@ app.post('/incoming-call', async (req, res) => {
     res.type('text/xml').send(twiml);
 });
 
-// Helper: Injects the AI (Software Leg)
-async function injectAIBot(host, room) {
-    try {
-        await client.calls.create({
-            to: 'client:AI_BOT', // Internal dummy client (free/fast)
-            from: TWILIO_PHONE_NUMBER,
-            url: `https://${host}/join-ai-leg?room=${room}`
-        });
-        console.log("[INJECT] AI Bot dispatched.");
-    } catch (e) { console.error("[ERROR] AI Bot failed:", e); }
-}
-
-// Helper: Injects the Music (Loopback Leg)
-async function injectMusicBot(host, room) {
-    try {
-        await client.calls.create({
-            to: TWILIO_PHONE_NUMBER, // Loopback call to trigger Logic A
-            from: TWILIO_PHONE_NUMBER,
-            url: `https://${host}/join-conf-leg?room=${room}`
-        });
-        console.log("[INJECT] Music Bot dispatched.");
-    } catch (e) { console.error("[ERROR] Music Bot failed:", e); }
-}
-
-// Route: Puts a Ghost Leg into the Conference
-app.post('/join-conf-leg', (req, res) => {
-    const room = req.query.room;
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Dial>
-            <Conference>${room}</Conference>
-        </Dial>
-    </Response>`;
-    res.type('text/xml').send(twiml);
-});
-
-// Route: Sets up the AI Leg (Stream + Conference)
+// =========================================================================
+// ROUTE 2: THE AI LEG (The Ghost)
+// =========================================================================
 app.post('/join-ai-leg', (req, res) => {
     const room = req.query.room;
+    console.log(`[AI LEG] Joining Conference: ${room}`);
+
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Start>
+        <Connect>
             <Stream url="wss://${req.headers.host}/media-stream" />
-        </Start>
+        </Connect>
         <Dial>
             <Conference>${room}</Conference>
         </Dial>
@@ -119,11 +75,12 @@ app.post('/join-ai-leg', (req, res) => {
 });
 
 // =========================================================================
-// WEBSOCKET HANDLER (Standard AI Logic)
+// WEBSOCKET HANDLER (AI Audio Processing)
 // =========================================================================
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Volume Boost Table (Makes user louder for AI)
 const muLawToLinearTable = new Int16Array(256);
 const VOLUME_BOOST = 5.0; 
 for (let i = 0; i < 256; i++) {
@@ -135,6 +92,7 @@ for (let i = 0; i < 256; i++) {
 
 wss.on('connection', (ws) => {
     console.log("[ws] AI Connected");
+    
     let streamSid = null;
     let elevenLabsWs = null;
     let audioQueue = Buffer.alloc(0);
@@ -144,12 +102,14 @@ wss.on('connection', (ws) => {
     let lastInputSample = 0;
 
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
+    
     try {
         elevenLabsWs = new WebSocket(elevenLabsUrl, { headers: { 'xi-api-key': ELEVENLABS_API_KEY } });
     } catch (err) { console.error('[FATAL]', err); return; }
 
     elevenLabsWs.on('open', () => console.log("[11Labs] Socket OPEN"));
 
+    // AI -> Conference
     elevenLabsWs.on('message', (data) => {
         try {
             const msg = JSON.parse(data.toString());
@@ -157,7 +117,6 @@ wss.on('connection', (ws) => {
             if (msg.audio_event) {
                 if (msg.audio_event.audio_base_64) chunkData = msg.audio_event.audio_base_64;
                 else if (msg.audio_event.audio_base64_chunk) chunkData = msg.audio_event.audio_base64_chunk;
-                else if (msg.audio_event.audio) chunkData = msg.audio_event.audio;
             }
             if (chunkData) {
                 const newChunk = Buffer.from(chunkData, 'base64');
@@ -170,6 +129,7 @@ wss.on('connection', (ws) => {
         } catch (e) { }
     });
 
+    // Conference -> AI
     ws.on('message', (message) => {
         try {
             const msg = JSON.parse(message);
