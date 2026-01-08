@@ -8,16 +8,23 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, maxPayload: 1048576 });
 
+// Parse incoming form data
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+
 // Settings
-const BG_VOLUME = 0.08; // 8% volume - adjust for good background level
+const BG_VOLUME = 0.08;
 const AI_VOLUME = 1.0;
-const MIC_BOOST = 8.0;  // Boost user input for AI
-const SAMPLE_RATE = 8000;
-const CHUNK_SIZE = 160; // 20ms at 8000Hz
-const OUTPUT_BUFFER_LIMIT = 20; // Max 20 chunks (400ms)
+const MIC_BOOST = 8.0;
+const OUTPUT_BUFFER_LIMIT = 20;
+
+// IMPORTANT: ElevenLabs settings - they accept 16kHz input
+const ELEVENLABS_INPUT_RATE = 16000; // AI hears at 16kHz
+const TWILIO_SAMPLE_RATE = 8000; // Twilio sends/receives at 8kHz
+const AI_OUTPUT_RATE = 8000; // AI responds at 8kHz
 
 // Audio State
-let BACKGROUND_PCM = null; // Will hold Int16Array
+let BACKGROUND_PCM = null;
 
 // --- Mu-Law Conversion (G.711) ---
 const BIAS = 0x84;
@@ -75,15 +82,36 @@ function linearToMuLaw(pcmBuffer) {
     
     for (let i = 0; i < length; i++) {
         let sample = pcmBuffer[i];
-        
-        // Ensure sample is within valid range
         if (sample < -32768) sample = -32768;
         if (sample > 32767) sample = 32767;
-        
         const index = sample < 0 ? 32768 - sample : sample;
         muLaw[i] = linearToMuLawTable[index];
     }
     return muLaw;
+}
+
+// Simple upsampling from 8kHz to 16kHz (for ElevenLabs input)
+function upsample8kTo16k(pcm8k) {
+    const length = pcm8k.length;
+    const pcm16k = new Int16Array(length * 2);
+    
+    for (let i = 0; i < length; i++) {
+        const sample = pcm8k[i];
+        pcm16k[i * 2] = sample;
+        pcm16k[i * 2 + 1] = sample; // Simple duplication (nearest neighbor)
+    }
+    return pcm16k;
+}
+
+// Simple downsampling from 16kHz to 8kHz
+function downsample16kTo8k(pcm16k) {
+    const length = Math.floor(pcm16k.length / 2);
+    const pcm8k = new Int16Array(length);
+    
+    for (let i = 0; i < length; i++) {
+        pcm8k[i] = pcm16k[i * 2]; // Take every other sample
+    }
+    return pcm8k;
 }
 
 // --- Load Raw PCM Background Audio ---
@@ -97,12 +125,6 @@ async function loadBackgroundSound() {
                 if (res.statusCode !== 200) {
                     reject(new Error(`Failed to load audio: HTTP ${res.statusCode}`));
                     return;
-                }
-                
-                // Check content type (optional but helpful)
-                const contentType = res.headers['content-type'];
-                if (contentType && contentType.includes('text/html')) {
-                    console.warn('Warning: Server returned HTML, not raw audio');
                 }
                 
                 const chunks = [];
@@ -120,29 +142,9 @@ async function loadBackgroundSound() {
                             pcmData[i] = buffer.readInt16LE(i * 2);
                         }
                         
-                        // Check if audio is actually 8000Hz mono
-                        const duration = sampleCount / 8000;
-                        console.log(`Audio duration: ${duration.toFixed(2)} seconds (${sampleCount} samples)`);
-                        
-                        // Find peak for normalization
-                        let peak = 0;
+                        // Apply volume scaling
                         for (let i = 0; i < sampleCount; i++) {
-                            const absVal = Math.abs(pcmData[i]);
-                            if (absVal > peak) peak = absVal;
-                        }
-                        
-                        console.log(`Peak amplitude: ${peak} (max 32767)`);
-                        
-                        // Apply volume scaling and normalization if needed
-                        if (peak > 0) {
-                            const normalizeFactor = Math.min(1.0, 30000 / peak); // Leave headroom
-                            const volumeFactor = normalizeFactor * BG_VOLUME;
-                            
-                            for (let i = 0; i < sampleCount; i++) {
-                                pcmData[i] = Math.round(pcmData[i] * volumeFactor);
-                            }
-                            
-                            console.log(`Applied volume: ${(BG_VOLUME * 100).toFixed(1)}% (normalized ${(normalizeFactor * 100).toFixed(1)}%)`);
+                            pcmData[i] = Math.round(pcmData[i] * BG_VOLUME);
                         }
                         
                         BACKGROUND_PCM = pcmData;
@@ -156,10 +158,7 @@ async function loadBackgroundSound() {
             }
         );
         
-        req.on('error', (error) => {
-            reject(new Error(`Network error: ${error.message}`));
-        });
-        
+        req.on('error', reject);
         req.setTimeout(15000, () => {
             req.destroy();
             reject(new Error('Timeout loading background audio'));
@@ -167,18 +166,15 @@ async function loadBackgroundSound() {
     });
 }
 
-// --- Audio Processing Functions ---
+// Audio processing functions
 function boostAudio(pcmSamples) {
     const length = pcmSamples.length;
     const boosted = new Int16Array(length);
     
     for (let i = 0; i < length; i++) {
         let sample = pcmSamples[i] * MIC_BOOST;
-        
-        // Clamp to 16-bit range with headroom
         if (sample < -32768) sample = -32768;
         if (sample > 32767) sample = 32767;
-        
         boosted[i] = Math.round(sample);
     }
     return boosted;
@@ -201,17 +197,58 @@ function mixAudio(aiPcm, bgPcm, bgPosition) {
     return mixed;
 }
 
-// --- WebSocket Server ---
+// --- HTTP Routes for Twilio Webhooks ---
+app.post('/incoming-call', (req, res) => {
+    console.log('Incoming call received:', req.body.CallSid);
+    
+    // Return TwiML to start media stream
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Start>
+        <Stream url="wss://${req.headers.host}/media" />
+    </Start>
+    <Say>Please wait while we connect you.</Say>
+</Response>`;
+    
+    res.type('text/xml');
+    res.send(twiml);
+});
+
+app.post('/call-status', (req, res) => {
+    console.log('Call status update:', req.body.CallSid, req.body.CallStatus);
+    res.sendStatus(200);
+});
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        backgroundLoaded: BACKGROUND_PCM !== null,
+        connections: wss.clients.size
+    });
+});
+
+app.get('/', (req, res) => {
+    res.send('Audio Streaming Server - Ready for Calls');
+});
+
+// --- WebSocket Server for Media Streams ---
 wss.on('connection', (ws, req) => {
-    console.log('New Twilio connection:', req.socket.remoteAddress);
+    // Only handle media streams on /media path
+    if (req.url !== '/media') {
+        console.log('Rejecting non-media WebSocket connection:', req.url);
+        ws.close();
+        return;
+    }
+    
+    console.log('Media WebSocket connected');
     
     let elevenLabsWs = null;
     let streamSid = null;
     let aiPacketQueue = [];
     let bgPosition = 0;
     let isActive = true;
+    let lastSequence = 0;
     
-    // Cleanup function
     const cleanup = () => {
         if (!isActive) return;
         isActive = false;
@@ -220,10 +257,10 @@ wss.on('connection', (ws, req) => {
             elevenLabsWs.close();
         }
         aiPacketQueue = [];
-        console.log('Connection cleaned up');
+        console.log('Media connection cleaned up');
     };
     
-    // Handle Twilio messages
+    // Handle Twilio media stream messages
     ws.on('message', async (message) => {
         if (!isActive) return;
         
@@ -232,7 +269,7 @@ wss.on('connection', (ws, req) => {
             
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log(`Stream started: ${streamSid}`);
+                console.log(`Media stream started: ${streamSid}`);
                 
                 // Connect to ElevenLabs
                 const agentId = process.env.AGENT_ID;
@@ -244,6 +281,7 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 
+                // IMPORTANT: Tell ElevenLabs we're sending 16kHz PCM
                 elevenLabsWs = new WebSocket(
                     `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${agentId}&output_format=ulaw_8000`,
                     {
@@ -256,13 +294,12 @@ wss.on('connection', (ws, req) => {
                 elevenLabsWs.on('open', () => {
                     console.log('Connected to ElevenLabs');
                     
-                    // Send initial configuration if needed
+                    // Send configuration for 16kHz input
                     const config = {
                         type: 'config',
                         config: {
-                            stt: true,
-                            tts: true,
-                            backchanneling: false
+                            input_audio_format: 'pcm_16000',
+                            output_audio_format: 'ulaw_8000'
                         }
                     };
                     elevenLabsWs.send(JSON.stringify(config));
@@ -277,7 +314,6 @@ wss.on('connection', (ws, req) => {
                         if (aiMsg.audio_event?.audio_base64_chunk) {
                             const audioData = Buffer.from(aiMsg.audio_event.audio_base64_chunk, 'base64');
                             
-                            // Limit queue size
                             if (aiPacketQueue.length < OUTPUT_BUFFER_LIMIT) {
                                 aiPacketQueue.push(audioData);
                             } else {
@@ -300,30 +336,36 @@ wss.on('connection', (ws, req) => {
                 });
                 
             } else if (msg.event === 'media') {
-                // Skip processing if background audio isn't loaded
+                // Skip if background audio isn't loaded
                 if (!BACKGROUND_PCM) {
                     console.warn('Background audio not loaded yet');
                     return;
                 }
                 
                 const twilioPayload = Buffer.from(msg.media.payload, 'base64');
+                lastSequence = msg.sequenceNumber || 0;
                 
                 // --- Process Input: User -> AI ---
                 try {
-                    // Convert Mu-Law to PCM
-                    const userPcm = muLawToLinear(twilioPayload);
+                    // Convert Twilio's 8kHz mu-law to 8kHz PCM
+                    const userPcm8k = muLawToLinear(twilioPayload);
                     
                     // Boost volume for AI
-                    const boostedPcm = boostAudio(userPcm);
+                    const boostedPcm8k = boostAudio(userPcm8k);
                     
-                    // Convert back to Mu-Law for ElevenLabs
-                    const boostedMuLaw = linearToMuLaw(boostedPcm);
+                    // Upsample to 16kHz for ElevenLabs
+                    const boostedPcm16k = upsample8kTo16k(boostedPcm8k);
                     
-                    // Send to ElevenLabs if connected
+                    // Send to ElevenLabs as base64 PCM
                     if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                        // Convert Int16Array to bytes (little-endian)
+                        const pcmBuffer = new ArrayBuffer(boostedPcm16k.length * 2);
+                        const pcmView = new Int16Array(pcmBuffer);
+                        pcmView.set(boostedPcm16k);
+                        
                         const audioMessage = {
                             type: 'input_audio',
-                            audio_base64_chunk: boostedMuLaw.toString('base64')
+                            audio_base64_chunk: Buffer.from(pcmBuffer).toString('base64')
                         };
                         elevenLabsWs.send(JSON.stringify(audioMessage));
                     }
@@ -333,41 +375,34 @@ wss.on('connection', (ws, req) => {
                 
                 // --- Process Output: AI + BG -> User ---
                 try {
-                    let outputPcm;
+                    let outputPcm8k;
                     
                     if (aiPacketQueue.length > 0) {
-                        // Get AI audio from queue
+                        // Get AI audio from queue (already 8kHz mu-law from ElevenLabs)
                         const aiMuLaw = aiPacketQueue.shift();
-                        const aiPcm = muLawToLinear(aiMuLaw);
+                        const aiPcm8k = muLawToLinear(aiMuLaw);
                         
                         // Mix with background audio
-                        outputPcm = mixAudio(aiPcm, BACKGROUND_PCM, bgPosition);
-                        bgPosition = (bgPosition + aiPcm.length) % BACKGROUND_PCM.length;
+                        outputPcm8k = mixAudio(aiPcm8k, BACKGROUND_PCM, bgPosition);
+                        bgPosition = (bgPosition + aiPcm8k.length) % BACKGROUND_PCM.length;
                     } else {
                         // No AI audio, just send background
-                        const chunkSize = Math.min(CHUNK_SIZE, BACKGROUND_PCM.length - bgPosition);
-                        outputPcm = BACKGROUND_PCM.subarray(bgPosition, bgPosition + chunkSize);
-                        
-                        // If we need to wrap around
-                        if (chunkSize < CHUNK_SIZE) {
-                            const remaining = CHUNK_SIZE - chunkSize;
-                            const combined = new Int16Array(CHUNK_SIZE);
-                            combined.set(outputPcm);
-                            combined.set(BACKGROUND_PCM.subarray(0, remaining), chunkSize);
-                            outputPcm = combined;
-                            bgPosition = remaining;
-                        } else {
-                            bgPosition += chunkSize;
+                        const chunkSize = 160; // 20ms at 8kHz
+                        if (bgPosition + chunkSize > BACKGROUND_PCM.length) {
+                            bgPosition = 0;
                         }
+                        outputPcm8k = BACKGROUND_PCM.slice(bgPosition, bgPosition + chunkSize);
+                        bgPosition += chunkSize;
                     }
                     
                     // Convert to Mu-Law for Twilio
-                    const outputMuLaw = linearToMuLaw(outputPcm);
+                    const outputMuLaw = linearToMuLaw(outputPcm8k);
                     
                     // Send to Twilio
                     const response = {
                         streamSid: streamSid,
                         event: 'media',
+                        sequenceNumber: lastSequence + 1,
                         media: {
                             payload: outputMuLaw.toString('base64')
                         }
@@ -377,12 +412,22 @@ wss.on('connection', (ws, req) => {
                         ws.send(JSON.stringify(response));
                     }
                     
+                    // Send mark periodically
+                    if (Math.random() < 0.1) {
+                        const mark = {
+                            streamSid: streamSid,
+                            event: 'mark',
+                            mark: { name: 'chunk' }
+                        };
+                        ws.send(JSON.stringify(mark));
+                    }
+                    
                 } catch (error) {
                     console.error('Error processing output audio:', error.message);
                 }
                 
             } else if (msg.event === 'stop') {
-                console.log('Stream stopped:', streamSid);
+                console.log('Media stream stopped:', streamSid);
                 cleanup();
             }
             
@@ -392,43 +437,27 @@ wss.on('connection', (ws, req) => {
     });
     
     ws.on('error', (error) => {
-        console.error('Twilio WebSocket error:', error.message);
+        console.error('Media WebSocket error:', error.message);
         cleanup();
     });
     
     ws.on('close', () => {
-        console.log('Twilio connection closed');
+        console.log('Media WebSocket closed');
         cleanup();
-    });
-});
-
-// --- HTTP Routes ---
-app.get('/', (req, res) => {
-    res.json({
-        status: 'online',
-        backgroundLoaded: BACKGROUND_PCM !== null,
-        connections: wss.clients.size
-    });
-});
-
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        backgroundSamples: BACKGROUND_PCM ? BACKGROUND_PCM.length : 0
     });
 });
 
 // --- Startup ---
 server.listen(PORT, async () => {
-    console.log(`Server starting on port ${PORT}...`);
+    console.log(`Server started on port ${PORT}`);
+    console.log(`HTTP endpoint: http://localhost:${PORT}/incoming-call`);
+    console.log(`WebSocket endpoint: ws://localhost:${PORT}/media`);
     
     try {
         await loadBackgroundSound();
         console.log('Server initialized successfully');
     } catch (error) {
-        console.error('CRITICAL: Failed to load background audio:', error.message);
+        console.error('Failed to load background audio:', error.message);
         console.log('Server will start without background audio');
     }
 });
