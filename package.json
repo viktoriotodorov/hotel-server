@@ -1,22 +1,14 @@
 {
   "name": "audio-streaming-server",
   "version": "1.0.0",
-  "description": "Real-time audio streaming server mixing Twilio calls with AI agent and background music",
+  "description": "Real-time audio streaming server for Twilio Media Streams and ElevenLabs",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
-    "test": "echo \"No tests yet\" && exit 0"
+    "dev": "nodemon index.js"
   },
-  "keywords": [
-    "twilio",
-    "websocket",
-    "audio",
-    "streaming",
-    "elevenlabs",
-    "real-time"
-  ],
-  "author": "Your Name",
+  "keywords": ["twilio", "websocket", "audio", "streaming", "elevenlabs"],
+  "author": "",
   "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
