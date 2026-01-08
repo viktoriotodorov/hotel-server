@@ -1,49 +1,11 @@
-const express = require('express');
-const WebSocket = require('ws');
-const http = require('http');
-const path = require('path');
-
-// 1. Load Environment Variables
-const PORT = process.env.PORT || 3000;
-const AGENT_ID = process.env.AGENT_ID;
-const API_KEY = process.env.ELEVENLABS_API_KEY;
-
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-
-// Serve static files (The Music)
-app.use('/public', express.static(path.join(__dirname, 'public')));
-
-// 2. Incoming Call Webhook
-app.post('/incoming-call', (req, res) => {
-    const musicUrl = `https://${req.headers.host}/public/lobby-quiet.mp3`;
-    console.log(`[Twilio] Call incoming from ${req.body.From}`);
-
-    // TwiML: Music in foreground, AI in background (inbound_track)
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Start>
-            <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
-        </Start>
-        <Play loop="0">${musicUrl}</Play>
-    </Response>`;
-
-    res.type('text/xml').send(twiml);
-});
-
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// 3. WebSocket Handler (The Relay)
+// 3. WebSocket Handler
 wss.on('connection', (ws) => {
     console.log("[SYSTEM] Twilio connected");
     
     let streamSid = null;
     let elevenLabsWs = null;
-    let audioQueue = []; // Simple array queue for the race condition
+    let audioQueue = [];
 
-    // Connect to ElevenLabs
-    // output_format=ulaw_8000 ensures we get phone-ready audio (No DSP needed)
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -55,62 +17,69 @@ wss.on('connection', (ws) => {
         return;
     }
 
-    elevenLabsWs.on('open', () => console.log("[11LABS] Connected"));
+    elevenLabsWs.on('open', () => console.log("[11LABS] Connected to AI"));
 
-    // Handle AI Speaking (AI -> Twilio)
+    // --- AI -> PHONE ( The Broken Part ) ---
     elevenLabsWs.on('message', (data) => {
         try {
-            const msg = JSON.parse(data.toString());
+            // Ensure data is a string before parsing
+            const msgStr = data.toString();
+            const msg = JSON.parse(msgStr);
 
+            // Check if this is an audio packet
             if (msg.audio_event?.audio_base64_chunk) {
+                const chunk = msg.audio_event.audio_base64_chunk;
+                
+                // DEBUG LOG: Prove we got data
+                // console.log(`[11LABS] Received audio chunk: ${chunk.length} chars`);
+
                 const audioPayload = {
                     event: 'media',
                     streamSid: streamSid,
-                    media: { payload: msg.audio_event.audio_base64_chunk }
+                    media: { payload: chunk }
                 };
 
-                // RACE CONDITION FIX:
-                // If we don't have the streamSid yet, save the audio for later.
+                // Buffer Logic
                 if (streamSid === null) {
                     audioQueue.push(audioPayload);
+                    console.log("[Buffer] Queued chunk (Waiting for StreamSid)");
                 } else {
-                    // Send directly - no complex buffering
                     ws.send(JSON.stringify(audioPayload));
                 }
             }
-        } catch (e) { console.log('[11Labs Error]', e); }
+        } catch (e) { 
+            console.log('[11Labs Error] Parsing failed:', e); 
+        }
     });
 
-    // Handle Human Speaking (Twilio -> AI)
+    // --- PHONE -> AI ( This works fine ) ---
     ws.on('message', (message) => {
         try {
             const msg = JSON.parse(message);
 
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
-                console.log("[TWILIO] Stream started:", streamSid);
+                console.log("[TWILIO] Stream started. ID:", streamSid);
 
-                // FLUSH QUEUE: Send any waiting audio immediately
+                // Flush Queue
                 if (audioQueue.length > 0) {
-                    console.log(`[Buffer] Flushing ${audioQueue.length} queued chunks.`);
+                    console.log(`[Buffer] Flushing ${audioQueue.length} chunks to phone.`);
                     audioQueue.forEach(chunk => {
-                        chunk.streamSid = streamSid; 
+                        chunk.streamSid = streamSid;
                         ws.send(JSON.stringify(chunk));
                     });
-                    audioQueue = []; 
+                    audioQueue = [];
                 }
 
             } else if (msg.event === 'media') {
                 if (elevenLabsWs.readyState === WebSocket.OPEN) {
-                    // PASS-THROUGH STRATEGY: 
-                    // We send the raw 8k audio. ElevenLabs is usually smart enough to handle it.
-                    // This eliminates the lag caused by the "DSP Engine".
                     const aiInput = {
                         user_audio_chunk: msg.media.payload
                     };
                     elevenLabsWs.send(JSON.stringify(aiInput));
                 }
             } else if (msg.event === 'stop') {
+                console.log("[TWILIO] Call ended");
                 if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
             }
         } catch (e) { console.log('[Twilio Error]', e); }
@@ -120,5 +89,3 @@ wss.on('connection', (ws) => {
         if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
     });
 });
-
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
