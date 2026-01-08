@@ -18,7 +18,6 @@ app.use('/public', express.static(path.join(__dirname, 'public')));
 app.post('/incoming-call', (req, res) => {
     console.log(`\n[CALL START] Incoming from ${req.body.From}`);
 
-    // TwiML: Standard "Connect"
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
@@ -63,11 +62,12 @@ wss.on('connection', (ws) => {
 
             // Handle Audio
             if (msg.audio_event) {
-                // *** THE FIX: Check for the correct key name (audio_base_64) ***
+                // *** THE FIX: Check for 'audio_base_64' (Agent API standard) ***
+                // We leave the other one as a fallback just in case.
                 const chunk = msg.audio_event.audio_base_64 || msg.audio_event.audio_base64_chunk;
                 
                 if (chunk) {
-                    // console.log(`[RECEIVED] Audio Chunk: ${chunk.length} bytes`); // Uncomment to see flow
+                    // console.log(`[RECEIVED] Audio Chunk: ${chunk.length} bytes`); 
                     
                     const audioPayload = {
                         event: 'media',
@@ -81,9 +81,7 @@ wss.on('connection', (ws) => {
                         ws.send(JSON.stringify(audioPayload));
                     }
                 } else {
-                    // Only log if we genuinely got an empty event
-                    console.log("[ERROR] Received audio_event but no data found inside.");
-                    console.log("Keys:", Object.keys(msg.audio_event));
+                    console.log("[ERROR] Received audio_event but data was empty. Keys:", Object.keys(msg.audio_event));
                 }
             }
 
