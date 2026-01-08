@@ -9,20 +9,21 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 // ==================== SETTINGS ====================
-const BG_VOLUME = 0.08;     // 8% Volume (Applied during load)
+const BG_VOLUME = 0.08;     // 8% Volume (Pre-applied during load)
 const AI_VOLUME = 1.0;      // 100% AI Volume
-const MIC_BOOST = 5.0;      // Boost user input so AI hears you
+const MIC_BOOST = 5.0;      // 5.0 is safer than 8.0 to avoid clipping
 
 // Global Background Audio Buffer
 let BACKGROUND_PCM = null;
 
-// ==================== G.711 Mu-Law TABLES ====================
+// ==================== G.711 Mu-Law TABLES (FIXED) ====================
+// We pre-calculate these tables for performance. 
 const muLawToLinearTable = new Int16Array(256);
 const linearToMuLawTable = new Uint8Array(65536);
 const BIAS = 0x84;
 const CLIP = 32635;
 
-// Generate Mu-Law to Linear Table
+// 1. Generate Mu-Law -> Linear Table
 for (let i = 0; i < 256; i++) {
     let mu = ~i;
     let sign = (mu & 0x80) >> 7;
@@ -32,23 +33,33 @@ for (let i = 0; i < 256; i++) {
     muLawToLinearTable[i] = sign === 0 ? -sample : sample;
 }
 
-// Generate Linear to Mu-Law Table
+// 2. Generate Linear -> Mu-Law Table (FIXED for full range)
+// We map every possible 16-bit integer (-32768 to 32767) to a mu-law byte
 for (let i = 0; i < 65536; i++) {
-    let sample = i - 32768;
-    if (sample < -CLIP) sample = -CLIP;
-    if (sample > CLIP) sample = CLIP;
+    // Map index 0..65535 to sample -32768..32767
+    let sample = i - 32768; 
+    
+    // G.711 Encoding Logic
     let sign = (sample < 0) ? 0x80 : 0;
-    sample = (sample < 0) ? -sample : sample;
+    if (sample < 0) sample = -sample;
+    if (sample > CLIP) sample = CLIP;
     sample += BIAS;
+    
     let exponent = 7;
     for (let exp = 0; exp < 8; exp++) {
-        if (sample < (1 << (exp + 5))) { exponent = exp; break; }
+        if (sample < (1 << (exp + 5))) {
+            exponent = exp;
+            break;
+        }
     }
+    
     let mantissa = (sample >> (exponent + 3)) & 0x0F;
-    linearToMuLawTable[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF;
+    let muLawByte = ~(sign | (exponent << 4) | mantissa);
+    
+    linearToMuLawTable[i] = muLawByte & 0xFF;
 }
 
-// ==================== HELPER FUNCTIONS (NOW INCLUDED) ====================
+// ==================== HELPER FUNCTIONS ====================
 function muLawToLinear(buffer) {
     const pcm = new Int16Array(buffer.length);
     for (let i = 0; i < buffer.length; i++) {
@@ -61,7 +72,9 @@ function linearToMuLaw(pcmBuffer) {
     const muLaw = new Uint8Array(pcmBuffer.length);
     for (let i = 0; i < pcmBuffer.length; i++) {
         let sample = pcmBuffer[i];
+        // Map Int16 value to Table Index (0 to 65535)
         let index = sample + 32768;
+        // Clamp safety
         if (index < 0) index = 0;
         if (index > 65535) index = 65535;
         muLaw[i] = linearToMuLawTable[index];
@@ -84,6 +97,7 @@ function boostAudio(pcmSamples) {
     const boosted = new Int16Array(length);
     for (let i = 0; i < length; i++) {
         let sample = pcmSamples[i] * MIC_BOOST;
+        // Hard Clamp
         if (sample > 32767) sample = 32767;
         if (sample < -32768) sample = -32768;
         boosted[i] = sample;
@@ -94,14 +108,17 @@ function boostAudio(pcmSamples) {
 function mixAudio(aiPcm, bgPcm, bgPosition) {
     const length = aiPcm.length;
     const mixed = new Int16Array(length);
+    
     for (let i = 0; i < length; i++) {
         const bgIndex = (bgPosition + i) % bgPcm.length;
-        // Mix AI (Boosted) + Background (Pre-Scaled)
+        
+        // Background is already scaled. Only scale AI.
         let mixedSample = (aiPcm[i] * AI_VOLUME) + bgPcm[bgIndex];
         
-        // Clamp
+        // Clamp to Int16 range
         if (mixedSample > 32767) mixedSample = 32767;
         if (mixedSample < -32768) mixedSample = -32768;
+        
         mixed[i] = mixedSample;
     }
     return mixed;
@@ -111,7 +128,7 @@ function mixAudio(aiPcm, bgPcm, bgPosition) {
 async function loadBackgroundSound() {
     return new Promise((resolve, reject) => {
         console.log('[SYSTEM] Loading RAW background audio...');
-        // Using the .raw file which is headerless 16-bit PCM
+        // Expects headerless 16-bit PCM, 8000Hz, Mono
         const req = https.get(
             "https://raw.githubusercontent.com/viktoriotodorov/hotel-server/main/backgroundn.raw",
             (res) => {
@@ -121,15 +138,17 @@ async function loadBackgroundSound() {
                     try {
                         const buffer = Buffer.concat(chunks);
                         if (buffer.length < 1000) {
-                            console.error("[ERROR] File too small.");
+                            console.error("[ERROR] File too small. Check URL.");
                             resolve(); return;
                         }
 
-                        const sampleCount = buffer.length / 2;
+                        // Convert bytes to Int16 samples
+                        const sampleCount = Math.floor(buffer.length / 2);
                         const pcmData = new Int16Array(sampleCount);
                         
                         // PRE-SCALE VOLUME (Optimization)
                         for (let i = 0; i < sampleCount; i++) {
+                            // Read 16-bit Little Endian and Apply Volume immediately
                             pcmData[i] = buffer.readInt16LE(i * 2) * BG_VOLUME;
                         }
                         
@@ -159,7 +178,6 @@ app.post('/incoming-call', (req, res) => {
         <Stream url="wss://${req.headers.host}/media" />
     </Connect>
 </Response>`;
-    
     res.type('text/xml');
     res.send(twiml);
 });
@@ -177,7 +195,6 @@ wss.on('connection', (ws, req) => {
     const MAX_QUEUE_SIZE = 50;
     
     function connectToElevenLabs() {
-        // Output format: u-law 8000Hz (matches Phone)
         const url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${process.env.AGENT_ID}&output_format=ulaw_8000`;
         elevenLabsWs = new WebSocket(url, { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } });
         
@@ -216,9 +233,9 @@ wss.on('connection', (ws, req) => {
             const boostedPCM = boostAudio(userAudioPCM);
             const audioForAI = upsample8kTo16k(boostedPCM);
             
+            // Send to ElevenLabs if ready
             if (elevenLabsWs?.readyState === WebSocket.OPEN) {
                 const pcmBuffer = Buffer.from(audioForAI.buffer);
-                // Correct Message Type
                 elevenLabsWs.send(JSON.stringify({
                     type: 'user_audio_chunk',
                     audio_base64_chunk: pcmBuffer.toString('base64')
@@ -234,7 +251,7 @@ wss.on('connection', (ws, req) => {
                 finalAudioPCM = mixAudio(aiAudioPCM, BACKGROUND_PCM, bgAudioIndex);
                 bgAudioIndex = (bgAudioIndex + aiAudioPCM.length) % BACKGROUND_PCM.length;
             } else {
-                // AI is silent: Play BG only
+                // AI is silent: Play BG only (20ms chunk = 160 samples)
                 const chunkSize = 160;
                 finalAudioPCM = new Int16Array(chunkSize);
                 for (let i = 0; i < chunkSize; i++) {
@@ -263,6 +280,7 @@ wss.on('connection', (ws, req) => {
     });
 });
 
+// ==================== STARTUP ====================
 server.listen(PORT, async () => {
     console.log(`[SYSTEM] Server running on port ${PORT}`);
     try {
