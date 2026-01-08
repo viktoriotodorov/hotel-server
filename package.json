@@ -1,7 +1,7 @@
 {
-  "name": "elevenlabs-twilio-background-audio",
+  "name": "hotel-alpha-ai",
   "version": "1.0.0",
-  "description": "Twilio + ElevenLabs Conversational AI with Background Music",
+  "description": "Twilio Conference AI with ElevenLabs",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.13.0",
-    "twilio": "^4.19.0"
+    "twilio": "^4.19.0",
+    "dotenv": "^16.3.1"
   },
   "engines": {
     "node": ">=16.0.0"
