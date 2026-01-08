@@ -3,122 +3,92 @@ const WebSocket = require('ws');
 const http = require('http');
 const path = require('path');
 
-// 1. Load Environment Variables
 const PORT = process.env.PORT || 3000;
 const AGENT_ID = process.env.AGENT_ID;
 const API_KEY = process.env.ELEVENLABS_API_KEY;
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-
-// Serve static files
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
-// 2. Incoming Call Webhook
 app.post('/incoming-call', (req, res) => {
     console.log(`\n[CALL START] Incoming from ${req.body.From}`);
-
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
             <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
         </Start>
-        <Say>Connecting to Hotel Alpha.</Say>
+        <Say>X-Ray Debugger Started.</Say>
         <Pause length="100" />
     </Response>`;
-
     res.type('text/xml').send(twiml);
 });
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 3. WebSocket Handler
 wss.on('connection', (ws) => {
     console.log("[ws] Twilio connected");
-    
     let streamSid = null;
     let elevenLabsWs = null;
-    let audioQueue = [];
+    let hasLoggedStructure = false; // Flag to log only the first packet
 
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
-        elevenLabsWs = new WebSocket(elevenLabsUrl, {
-            headers: { 'xi-api-key': API_KEY }
-        });
-    } catch (err) {
-        console.error('[FATAL] 11Labs socket failed:', err);
-        return;
-    }
+        elevenLabsWs = new WebSocket(elevenLabsUrl, { headers: { 'xi-api-key': API_KEY } });
+    } catch (err) { console.error('[FATAL]', err); return; }
 
     elevenLabsWs.on('open', () => console.log("[11Labs] Socket OPEN"));
 
-    // --- AI -> PHONE ---
     elevenLabsWs.on('message', (data) => {
         try {
-            const msgStr = data.toString();
-            const msg = JSON.parse(msgStr);
+            const msg = JSON.parse(data.toString());
 
-            // Handle Audio
+            // --- THE X-RAY: INSPECT THE PACKET ---
             if (msg.audio_event) {
-                // *** THE FIX: Check for 'audio_base_64' (Agent API standard) ***
-                // We leave the other one as a fallback just in case.
-                const chunk = msg.audio_event.audio_base_64 || msg.audio_event.audio_base64_chunk;
-                
-                if (chunk) {
-                    // console.log(`[RECEIVED] Audio Chunk: ${chunk.length} bytes`); 
-                    
-                    const audioPayload = {
-                        event: 'media',
-                        streamSid: streamSid,
-                        media: { payload: chunk }
-                    };
+                // 1. Log the KEYS inside the audio event
+                if (!hasLoggedStructure) {
+                    console.log(`\n🔎 [X-RAY] Audio Event Keys: ${JSON.stringify(Object.keys(msg.audio_event))}`);
+                    hasLoggedStructure = true;
+                }
 
-                    if (streamSid === null) {
-                        audioQueue.push(audioPayload);
-                    } else {
-                        ws.send(JSON.stringify(audioPayload));
+                // 2. Extract Data (Try both keys)
+                const chunk = msg.audio_event.audio_base_64 || msg.audio_event.audio_base64_chunk;
+
+                if (chunk) {
+                    // 3. Log the SIZE (Critical: Is it 0?)
+                    console.log(`✅ [SENDING] Chunk Size: ${chunk.length} chars`);
+                    
+                    if (streamSid) {
+                        ws.send(JSON.stringify({
+                            event: 'media',
+                            streamSid: streamSid,
+                            media: { payload: chunk }
+                        }));
                     }
                 } else {
-                    console.log("[ERROR] Received audio_event but data was empty. Keys:", Object.keys(msg.audio_event));
+                    console.log("❌ [ERROR] Audio event received, but both keys are NULL!");
                 }
             }
+            // Log text to ensure AI is thinking
+            if (msg.agent_response_event) {
+                console.log(`🗣️ [AI]: "${msg.agent_response_event.agent_response}"`);
+            }
 
-        } catch (e) { 
-            console.log('[11Labs Parsing Error]', e); 
-        }
+        } catch (e) { console.log('[Parsing Error]', e); }
     });
 
-    // --- PHONE -> AI ---
     ws.on('message', (message) => {
         try {
             const msg = JSON.parse(message);
-
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
                 console.log(`[Twilio] Stream Started: ${streamSid}`);
-
-                if (audioQueue.length > 0) {
-                    audioQueue.forEach(chunk => {
-                        chunk.streamSid = streamSid;
-                        ws.send(JSON.stringify(chunk));
-                    });
-                    audioQueue = [];
-                }
-            } else if (msg.event === 'media') {
-                if (elevenLabsWs.readyState === WebSocket.OPEN) {
-                    const aiInput = { user_audio_chunk: msg.media.payload };
-                    elevenLabsWs.send(JSON.stringify(aiInput));
-                }
-            } else if (msg.event === 'stop') {
-                if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
+            } else if (msg.event === 'media' && elevenLabsWs.readyState === WebSocket.OPEN) {
+                elevenLabsWs.send(JSON.stringify({ user_audio_chunk: msg.media.payload }));
             }
-        } catch (e) { console.log('[Twilio Error]', e); }
-    });
-
-    ws.on('close', () => {
-        if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
+        } catch (e) { }
     });
 });
 
