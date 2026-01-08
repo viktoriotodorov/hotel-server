@@ -10,35 +10,38 @@ const API_KEY = process.env.ELEVENLABS_API_KEY;
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+
+// Serve static files
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
 // 2. Incoming Call Webhook
 app.post('/incoming-call', (req, res) => {
     console.log(`\n[CALL START] Incoming from ${req.body.From}`);
-    // TwiML: NO MUSIC - Pure AI Connection for Debugging
+
+    // TwiML: Standard "Connect"
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Start>
             <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
         </Start>
-        <Say>Debugger active. Connecting now.</Say>
+        <Say>Connecting to Hotel Alpha.</Say>
         <Pause length="100" />
     </Response>`;
+
     res.type('text/xml').send(twiml);
 });
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 3. WebSocket Handler (The Ultimate Debugger)
+// 3. WebSocket Handler
 wss.on('connection', (ws) => {
     console.log("[ws] Twilio connected");
     
     let streamSid = null;
     let elevenLabsWs = null;
-    let packetCount = 0;
+    let audioQueue = [];
 
-    // Connect to ElevenLabs
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -51,63 +54,41 @@ wss.on('connection', (ws) => {
     }
 
     elevenLabsWs.on('open', () => console.log("[11Labs] Socket OPEN"));
-    elevenLabsWs.on('close', (code, reason) => console.log(`[11Labs] CLOSED. Code: ${code}, Reason: ${reason}`));
-    elevenLabsWs.on('error', (e) => console.error(`[11Labs] ERROR: ${e}`));
 
-    // --- AI -> PHONE (The Inspection Zone) ---
-    elevenLabsWs.on('message', (data, isBinary) => {
+    // --- AI -> PHONE ---
+    elevenLabsWs.on('message', (data) => {
         try {
-            // 1. Log the Data Type
-            if (isBinary) {
-                console.log(`[11Labs] RECEIVED BINARY FRAME (${data.length} bytes)`);
-                // If it's binary, it might be raw audio. Let's see if we can send it.
-                // (Usually ConvAI sends JSON, but if they changed it, this catches it)
-                return; 
-            }
-
-            // 2. Parse JSON
             const msgStr = data.toString();
             const msg = JSON.parse(msgStr);
 
-            // 3. Log the "Event Type" to see what they are actually sending
-            if (msg.type) {
-                // Ignore Pings to keep logs readable
-                if (msg.type !== 'ping') {
-                    console.log(`[11Labs MSG] Type: "${msg.type}" | Keys: ${Object.keys(msg)}`);
-                }
-            } else {
-                console.log(`[11Labs MSG] NO TYPE! Keys: ${Object.keys(msg)}`);
-            }
-
-            // 4. Check for Audio specifically
+            // Handle Audio
             if (msg.audio_event) {
-                const chunk = msg.audio_event.audio_base64_chunk;
+                // *** THE FIX: Check for the correct key name (audio_base_64) ***
+                const chunk = msg.audio_event.audio_base_64 || msg.audio_event.audio_base64_chunk;
+                
                 if (chunk) {
-                    console.log(`✅ [AUDIO FOUND] Chunk size: ${chunk.length}`);
+                    // console.log(`[RECEIVED] Audio Chunk: ${chunk.length} bytes`); // Uncomment to see flow
                     
-                    if (streamSid) {
-                        const audioPayload = {
-                            event: 'media',
-                            streamSid: streamSid,
-                            media: { payload: chunk }
-                        };
-                        ws.send(JSON.stringify(audioPayload));
+                    const audioPayload = {
+                        event: 'media',
+                        streamSid: streamSid,
+                        media: { payload: chunk }
+                    };
+
+                    if (streamSid === null) {
+                        audioQueue.push(audioPayload);
                     } else {
-                        console.log(`⚠️ [BUFFER] Audio received but StreamSid is null.`);
+                        ws.send(JSON.stringify(audioPayload));
                     }
                 } else {
-                    console.log(`❌ [AUDIO EVENT EMPTY] 'audio_base64_chunk' is missing!`);
+                    // Only log if we genuinely got an empty event
+                    console.log("[ERROR] Received audio_event but no data found inside.");
+                    console.log("Keys:", Object.keys(msg.audio_event));
                 }
-            } 
-            
-            // 5. Catch "Agent Response" (Text) but no Audio
-            if (msg.agent_response_event) {
-                console.log(`🗣️ [AI TEXT]: "${msg.agent_response_event.agent_response}"`);
             }
 
         } catch (e) { 
-            console.log('[PARSING ERROR]', e);
-            console.log('Raw Data was:', data.toString());
+            console.log('[11Labs Parsing Error]', e); 
         }
     });
 
@@ -115,16 +96,31 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         try {
             const msg = JSON.parse(message);
+
             if (msg.event === 'start') {
                 streamSid = msg.start.streamSid;
                 console.log(`[Twilio] Stream Started: ${streamSid}`);
+
+                if (audioQueue.length > 0) {
+                    audioQueue.forEach(chunk => {
+                        chunk.streamSid = streamSid;
+                        ws.send(JSON.stringify(chunk));
+                    });
+                    audioQueue = [];
+                }
             } else if (msg.event === 'media') {
                 if (elevenLabsWs.readyState === WebSocket.OPEN) {
                     const aiInput = { user_audio_chunk: msg.media.payload };
                     elevenLabsWs.send(JSON.stringify(aiInput));
                 }
+            } else if (msg.event === 'stop') {
+                if (elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
             }
         } catch (e) { console.log('[Twilio Error]', e); }
+    });
+
+    ws.on('close', () => {
+        if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) elevenLabsWs.close();
     });
 });
 
