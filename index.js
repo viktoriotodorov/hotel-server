@@ -1,4 +1,4 @@
-// index.js
+// index.js (Pure Passthrough - Protocol Compliant)
 require('dotenv').config();
 const express = require('express');
 const WebSocket = require('ws');
@@ -43,7 +43,8 @@ wss.on('connection', (ws) => {
     let streamSid = null;
     let elevenLabsWs = null;
 
-    // Connect to ElevenLabs with correct parameters
+    // Connect to ElevenLabs 
+    // CRITICAL: We request ulaw_8000. We MUST send ulaw_8000.
     const elevenLabsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&output_format=ulaw_8000`;
     
     try {
@@ -76,6 +77,10 @@ wss.on('connection', (ws) => {
         }
     });
 
+    // Handle Error / Close
+    elevenLabsWs.on('error', (err) => console.error('[11Labs] Error:', err.message));
+    elevenLabsWs.on('close', (code, reason) => console.log(`[11Labs] Closed: ${code} ${reason}`));
+
     // Handle User Speaking (Twilio -> Server -> ElevenLabs)
     ws.on('message', (msg) => {
         try {
@@ -88,12 +93,13 @@ wss.on('connection', (ws) => {
                     break;
 
                 case 'media':
-                    // OFFICIAL DOCUMENTATION FORMAT
-                    // Source: https://elevenlabs.io/docs/agents-platform/api-reference/agents-platform/websocket
-                    // The server expects: { "user_audio_chunk": "base64_string" }
+                    // PASSTHROUGH MODE:
+                    // Twilio sends 8k Mu-Law. ElevenLabs expects 8k Mu-Law.
+                    // We send the payload EXACTLY as we received it.
                     if (elevenLabsWs.readyState === WebSocket.OPEN) {
                         const audioMessage = {
-                            user_audio_chunk: data.media.payload
+                            type: 'user_audio_chunk',
+                            audio_base64_chunk: data.media.payload
                         };
                         elevenLabsWs.send(JSON.stringify(audioMessage));
                     }
